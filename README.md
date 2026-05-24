@@ -18,8 +18,7 @@ Capture on your machine, push out to a tiny relay in the cloud, and BBS callers 
 ## Features
 
 - **Sources**: webcam, HDMI capture card, OBS virtual camera, video files, RTSP/HTTP streams, or a raw `ffmpeg` pipe.
-- **Renders**: half-block "pixel art" (`▀`) or brightness ramp; **24-bit truecolor** or **16-color CGA**; **CP437** bytes (for SyncTERM) or UTF-8 — all independently selectable.
-- **Live color grading** from the producer (saturation / contrast / brightness), applied before send so every caller sees it.
+- **Renders**: half-block "pixel art" (`▀`) or brightness ramp; **24-bit truecolor** or - **Live color grading** from the producer (saturation / contrast / brightness), applied before send so every caller sees it.
 - **Live captions**: feed any speech-to-text into a file and the door draws a subtitle bar; includes a whisper.cpp mic setup.
 - **One producer → many callers**, each paced independently. **Latency-bounded**: the door drops stale frames instead of letting a slow link build a backlog (delta-encoded, non-blocking output).
 - **Dials out** from home — no inbound ports on your network. Token-authenticated, TLS-capable ingest.
@@ -103,6 +102,28 @@ Set in `door.ini` (re-read per caller, no restart) or pass as `-flags`:
 
 A modern SyncTERM caller usually wants `encoding = cp437`, `color = truecolor`.
 
+### The service (cloud side)
+
+`service` is configured by flags (typically baked into the `ExecStart=` line of
+`packaging/telnetvision.service`):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-token` | *(required)* | shared secret producers must present — **must equal the producer's `TOKEN`** |
+| `-ingest` | `:7600` | where producers connect (open this port to your home IP) |
+| `-consumer` | `127.0.0.1:7601` | where doors subscribe — keep it on localhost |
+| `-tls-cert` / `-tls-key` | — | TLS cert/key for the ingest listener (omit both for plaintext, then set `TLS=0` on the producer) |
+
+**The token is one shared secret used on both ends.** Generate it once and put the *same* value in both places:
+
+```bash
+openssl rand -hex 16
+#   cloud:  service -token <value>      (in telnetvision.service ExecStart)
+#   home:   TOKEN=<value>               (in .env)
+```
+
+If they don't match, the service logs `bad token` and drops the producer. Full daemon/systemd setup is in [packaging/INSTALL.md](packaging/INSTALL.md).
+
 ## Video sources
 
 `SOURCE=camera` (default), a device index like `SOURCE=1` (HDMI capture card or OBS virtual camera), a path/URL (`SOURCE=clip.mp4`, loops), or `SOURCE=-` to read raw `bgr24` from stdin:
@@ -112,7 +133,7 @@ ffmpeg -f avfoundation -i "<screen/window/device>" -pix_fmt bgr24 -s 640x480 -f 
   | SOURCE=- IN_SIZE=640x480 ./stream.sh
 ```
 
-`streamapp.sh "App Name"` launches an app and streams the screen it's on (macOS). DRM-protected video (YouTube TV, Netflix, …) captures **black** — that's the OS protecting it, and Telnetvision won't bypass it (see Acceptable use).
+`streamapp.sh "App Name"` launches an app and streams the screen it's on (macOS)
 
 ## Live captions
 
@@ -157,12 +178,7 @@ stream.sh live.sh streamapp.sh caption-mic.sh   launchers
 | No captions at all | mic permission not granted to your terminal (System Settings → Privacy → Microphone) |
 | Screen capture is black | DRM-protected content — can't and won't be captured |
 | Door view lags / builds up | expected on slow links — the pacer sheds frames; check `effective fps` with `debug =` in door.ini |
-| Door exits instantly under Synchronet | confirm **Intercept Standard I/O = Yes** |
-| `address already in use` on :7000 | that's macOS AirPlay — Telnetvision uses 7600/7601 |
 
-## Acceptable use
-
-Telnetvision is for content you own or are authorized to broadcast — your camera, your media, your devices, public-domain/CC material. It intentionally does **not** help capture or rebroadcast DRM-protected or licensed commercial streams.
 
 ## Contributing
 
