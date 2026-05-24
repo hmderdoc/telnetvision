@@ -446,7 +446,7 @@ func main() {
 		use16 = true
 	}
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", *host, *port))
+	conn, err := net.Dial("tcp", net.JoinHostPort(*host, strconv.Itoa(*port)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dial: %v\n", err)
 		os.Exit(1)
