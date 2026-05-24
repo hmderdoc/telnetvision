@@ -40,6 +40,8 @@ cp .env.example .env          # set BBS_HOST, BBS_PORT, TOKEN, ...
 
 Mirror keys: `+/-` saturation · `[ ]` contrast · `< >` brightness · `m` half-block↔ramp · `g` ramp glyphs · `q` quit.
 
+> **Platforms.** The `service`/`door` binaries build for Linux, macOS, and Windows (the BBS box). The home-side launchers (`stream.sh`, `live.sh`, …) are bash, so they run on macOS/Linux as-is; on Windows use WSL or Git Bash, or just run the Python directly (`python producer.py --host … --token …`) — there the venv lives at `.venv\Scripts\`.
+
 ### BBS / cloud side
 
 Download the release bundle for your OS/arch (or build — see below) and follow **[packaging/INSTALL.md](packaging/INSTALL.md)**. In short: run `service` as a daemon (listens for the producer on `:7600`, for doors on `127.0.0.1:7601`), open only `:7600` inbound, and add `door` as a Synchronet external program (Intercept Standard I/O = Yes, Multiple Concurrent Users = Yes).
@@ -126,23 +128,30 @@ If they don't match, the service logs `bad token` and drops the producer. Full d
 
 ## Video sources
 
-`SOURCE=camera` (default), a device index like `SOURCE=1` (HDMI capture card or OBS virtual camera), a path/URL (`SOURCE=clip.mp4`, loops), or `SOURCE=-` to read raw `bgr24` from stdin:
+`SOURCE=camera` (default), a device index like `SOURCE=1` (HDMI capture card or OBS virtual camera), a path/URL (`SOURCE=clip.mp4`, loops), or `SOURCE=-` to read raw `bgr24` from stdin. The stdin route lets any `ffmpeg` capture feed the producer — the input flag is OS-specific:
 
 ```bash
-ffmpeg -f avfoundation -i "<screen/window/device>" -pix_fmt bgr24 -s 640x480 -f rawvideo - \
+# macOS:    -f avfoundation -i "<screen/device index>"
+# Linux:    -f x11grab -i :0.0       (screen)  |  -f v4l2 -i /dev/video0   (webcam)
+# Windows:  -f gdigrab -i desktop    (screen)  |  -f dshow -i video="..."  (device)
+ffmpeg <input flags above> -pix_fmt bgr24 -s 640x480 -f rawvideo - \
   | SOURCE=- IN_SIZE=640x480 ./stream.sh
 ```
 
-`streamapp.sh "App Name"` launches an app and streams the screen it's on (macOS)
+`streamapp.sh "App Name"` launches an app and streams the screen it's on (macOS-only — it uses avfoundation screen capture).
 
 ## Live captions
 
 `caption-mic.sh` runs [whisper.cpp](https://github.com/ggerganov/whisper.cpp) on a chosen audio input and writes the current line to `CAPTION_FILE`; the producer broadcasts it.
 
+First install whisper.cpp's `whisper-stream`:
+- **macOS:** `brew install whisper-cpp`
+- **Linux:** your distro package if available, otherwise build from [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (`cmake -B build -DWHISPER_SDL2=ON && cmake --build build`)
+- **Windows:** prebuilt releases from the whisper.cpp repo, or build it
+
 ```bash
-brew install whisper-cpp        # provides whisper-stream
 ./models/download.sh            # base.en model (or: small.en for accuracy)
-./live.sh                       # stream + mic captions in one command
+./live.sh                       # stream + mic captions in one command (bash; macOS/Linux)
 ```
 
 Pick the audio input with `CAPTURE=<id>` (the device list is logged to `/tmp/whisper.log`). If captions read `[Music]`/`[sound effects]`, you're on the wrong input — see Troubleshooting.
