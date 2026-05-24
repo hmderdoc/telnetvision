@@ -1,0 +1,19 @@
+# Secrets — NEVER commit (.env holds your ingest token)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local build output (CI builds release artifacts; see .github/workflows)
+bin/
+dist/
+
+# Whisper models — large, downloaded on demand (see models/download.sh)
+models/*.bin
+
+# OS cruft
+.DS_Store
+/tmp/
+*.log

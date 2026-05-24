@@ -1,0 +1,23 @@
+[Unit]
+Description=Telnetvision fanout service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust user/paths to your install. The user must be able to read cert/key.
+User=sbbs
+Group=sbbs
+WorkingDirectory=/sbbs/xtrn/telnetvision
+ExecStart=/sbbs/xtrn/telnetvision/service \
+  -ingest :7600 \
+  -consumer 127.0.0.1:7601 \
+  -token CHANGE_ME_RUN_openssl_rand_hex_16 \
+  -tls-cert /sbbs/xtrn/telnetvision/cert.pem \
+  -tls-key /sbbs/xtrn/telnetvision/key.pem
+Restart=always
+RestartSec=2
+# The token is visible in `ps`/this unit; keep the box's local users trusted.
+
+[Install]
+WantedBy=multi-user.target

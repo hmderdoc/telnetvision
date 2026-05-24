@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Cross-compile service + door for every target
+        run: |
+          set -euo pipefail
+          for comp in service door; do
+            for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+              os="${t%/*}"; arch="${t#*/}"
+              GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go -C "$comp" build -o /dev/null .
+              echo "ok  $comp  $t"
+            done
+            go -C "$comp" vet ./...
+          done

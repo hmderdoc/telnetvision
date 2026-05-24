@@ -1,0 +1,47 @@
+name: release
+
+# Tag a version to build + publish bundles:  git tag v0.1.0 && git push --tags
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the GitHub Release and upload assets
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build bundles (service + door, all platforms)
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p out
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${t%/*}"; arch="${t#*/}"
+            ext=""; [ "$os" = windows ] && ext=".exe"
+            stage="telnetvision-${version}-${os}-${arch}"
+            mkdir -p "$stage"
+            (cd service && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "../$stage/service$ext" .)
+            (cd door    && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "../$stage/door$ext" .)
+            cp packaging/door.ini packaging/INSTALL.md packaging/telnetvision.service "$stage"/
+            if [ "$os" = windows ]; then
+              (cd "$stage" && zip -qr "../out/${stage}.zip" .)
+            else
+              tar -C "$stage" -czf "out/${stage}.tar.gz" .
+            fi
+            rm -rf "$stage"
+          done
+          ls -lh out
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
