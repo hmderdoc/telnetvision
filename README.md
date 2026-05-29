@@ -69,7 +69,7 @@ INSECURE=1                     # 1 = don't verify the cert (self-signed); 0 = ve
 # Optional extras (safe to omit):
 CAPTION_FILE=/tmp/caption.txt  # broadcast this file's last line as a subtitle
 # SOURCE=camera                # what to capture (see below)
-# CAPTURE=2                    # which audio input to transcribe (see Live captions)
+# CAPTURE=2                    # which audio input to transcribe — index OR name (see Live captions)
 # FLIP=0                       # mirror off (auto-mirrors only the default webcam)
 ```
 
@@ -84,7 +84,7 @@ CAPTION_FILE=/tmp/caption.txt  # broadcast this file's last line as a subtitle
 | `SOURCE` | `camera` | What to capture: `camera` (default webcam), a **device index** like `1` (HDMI capture card / OBS virtual cam), a **file or URL** (`clip.mp4`, `rtsp://…`), `-` (raw stdin from ffmpeg), or `test` (synthetic). |
 | `FLIP` | `0` | Horizontal mirror. Default *auto* mirrors only the selfie webcam; set `0` to force off (HDMI/files), `1` to force on. |
 | `CAPTION_FILE` | `/tmp/caption.txt` | The producer broadcasts this file's last line as a subtitle bar. Pair with `caption-mic.sh`. Omit to disable captions. |
-| `CAPTURE` | `2` | Which audio input `whisper-stream` transcribes (the SDL device index shown in `/tmp/whisper.log`). Omit to use the system default input. |
+| `CAPTURE` | `2` or `"usb audio"` | Which audio input `whisper-stream` transcribes. Either the integer SDL device index, or a **case-insensitive device-name substring** (resolved at startup — survives reorderings when AirPods or other inputs toggle). Run `LIST=1 ./caption-mic.sh` to dump the current devices. Omit to use the system default. |
 
 Render *look* (saturation, contrast, brightness, half-block↔ramp, ramp glyphs) is adjusted **live** with keys in the mirror, or seeded with `--saturation/--contrast/--brightness/--mode/--ramp`. `--in-size WxH` sets the frame size when `SOURCE=-`.
 
@@ -154,7 +154,7 @@ First install whisper.cpp's `whisper-stream`:
 ./live.sh                       # stream + mic captions in one command (bash; macOS/Linux)
 ```
 
-Pick the audio input with `CAPTURE=<id>` (the device list is logged to `/tmp/whisper.log`). If captions read `[Music]`/`[sound effects]`, you're on the wrong input — see Troubleshooting.
+Pick the audio input with `CAPTURE=<index>` or `CAPTURE="<name substring>"` — the latter is **resilient when devices shuffle** (e.g. AirPods toggling reorders SDL indices), at the cost of a ~10s discovery on startup. `LIST=1 ./caption-mic.sh` dumps the current device list cleanly so you don't have to fish through `/tmp/whisper.log`. If captions read `[Music]`/`[sound effects]`, you're on the wrong input — see Troubleshooting.
 
 ## Building from source
 
@@ -183,7 +183,7 @@ stream.sh live.sh streamapp.sh caption-mic.sh   launchers
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| Captions are `[Music]`/`[sound effects]` | whisper is on the wrong audio input — set `CAPTURE=<id>` from the list in `/tmp/whisper.log` |
+| Captions are `[Music]`/`[sound effects]` | whisper is on the wrong audio input — run `LIST=1 ./caption-mic.sh` to see devices, then `CAPTURE=<index>` or `CAPTURE="<name>"` to pin it |
 | No captions at all | mic permission not granted to your terminal (System Settings → Privacy → Microphone) |
 | Screen capture is black | DRM-protected content — can't and won't be captured |
 | Door view lags / builds up | expected on slow links — the pacer sheds frames; check `effective fps` with `debug =` in door.ini |

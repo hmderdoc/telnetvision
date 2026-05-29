@@ -22,6 +22,9 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # line with no trailing newline.)
 while IFS='=' read -r key val || [[ -n "$key" ]]; do
   [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue   # skip comments/blanks
+  # strip a matching pair of surrounding quotes (e.g. CAPTURE="usb audio")
+  # (use #?/%? rather than slice :1:-1 — the latter isn't in bash 3.2 on macOS)
+  if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then val="${val#?}"; val="${val%?}"; fi
   [[ -n "${!key+x}" ]] || export "$key=$val"
 done < .env
 
