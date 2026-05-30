@@ -24,7 +24,11 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
           mkdir -p out
-          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+          for t in linux/amd64 linux/arm64 linux/386 \
+                   darwin/amd64 darwin/arm64 \
+                   windows/amd64 windows/arm64 windows/386 \
+                   freebsd/amd64 freebsd/arm64 \
+                   openbsd/amd64 openbsd/arm64; do
             os="${t%/*}"; arch="${t#*/}"
             ext=""; [ "$os" = windows ] && ext=".exe"
             stage="telnetvision-${version}-${os}-${arch}"

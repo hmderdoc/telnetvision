@@ -18,7 +18,11 @@ jobs:
         run: |
           set -euo pipefail
           for comp in service door; do
-            for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            for t in linux/amd64 linux/arm64 linux/386 \
+                     darwin/amd64 darwin/arm64 \
+                     windows/amd64 windows/arm64 windows/386 \
+                     freebsd/amd64 freebsd/arm64 \
+                     openbsd/amd64 openbsd/arm64; do
               os="${t%/*}"; arch="${t#*/}"
               GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go -C "$comp" build -o /dev/null .
               echo "ok  $comp  $t"
