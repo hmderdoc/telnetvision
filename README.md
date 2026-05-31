@@ -94,6 +94,9 @@ BBS_HOST=your.bbs.hostname     # the cloud box running `service`
 BBS_PORT=7600                  # its ingest port (matches service -ingest)
 TOKEN=cfc29cba...              # matches service -token; make one: openssl rand -hex 16
 
+# Channel name. Must match the door's `channel=` in door.ini (both default `cam`).
+CHANNEL=cam                    # change to run a second feed (e.g. CHANNEL=desk)
+
 # How big a picture to send (in terminal cells; a BBS screen is 80x24/25).
 COLS=80
 ROWS=24
@@ -114,6 +117,7 @@ CAPTION_FILE=/tmp/caption.txt  # broadcast this file's last line as a subtitle
 | `BBS_HOST` | `futureland.today` | Hostname/IP of the cloud box running `service`. The producer dials *out* to it. |
 | `BBS_PORT` | `7600` | The service's **ingest** port. Must match the service's `-ingest`. |
 | `TOKEN` | `cfc29cba…` | Shared secret the producer presents to publish. Must equal the service's `-token`. Generate with `openssl rand -hex 16`. |
+| `CHANNEL` | `cam` | Channel name the producer publishes to. The service routes by channel: one publisher per channel, many door subscribers. **Must match the door's `channel=` in `door.ini`** (also `cam` by default). Use a different name to run a second feed alongside (e.g. `CHANNEL=desk` for a screencap channel, with a second door pointed at it). |
 | `COLS` / `ROWS` | `80` / `24` | Picture size in character **cells**. 80×24/25 fills a standard BBS screen; bigger looks sharper but only helps callers whose terminals are that large, and costs bandwidth. |
 | `TLS` | `1` | `1` wraps the connection in TLS (the service must have `-tls-cert/-tls-key`); `0` is plaintext (and the service must run *without* a cert). |
 | `INSECURE` | `1` | With `TLS=1`: `1` skips certificate verification — needed for a self-signed cert. Set `0` once you use a real/Let's-Encrypt cert. |
