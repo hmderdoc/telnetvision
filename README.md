@@ -66,7 +66,15 @@ The producer is Python and runs on Windows; the bash launchers (`stream.sh`, etc
    ```
    The live mirror (the `+/- m g q` keys) is **auto-disabled on Windows** because it relies on Unix TTY APIs — the stream itself works fine without it.
 
-For live mic captions on Windows you also need whisper.cpp's `whisper-stream` — prebuilt Windows releases or build from <https://github.com/ggerganov/whisper.cpp>. The `caption-mic.sh` launcher is bash; run it under Git Bash, or invoke `whisper-stream` directly and write its output to the file you set as `CAPTION_FILE`.
+For live mic captions on Windows you also need **whisper.cpp's `whisper-stream.exe`**. Grab a prebuilt zip from <https://github.com/ggml-org/whisper.cpp/releases> — pick `whisper-blas-bin-Win32.zip` (32-bit) or `whisper-blas-bin-x64.zip` (64-bit). Extract it; the zip ships `whisper-stream.exe`, `SDL2.dll`, and a ggml model is downloaded separately. Grab a model the same way the Mac/Linux side does — `ggml-base.en.bin` from <https://huggingface.co/ggerganov/whisper.cpp> works.
+
+`caption-mic.sh` is bash (run it under Git Bash if you'd rather), but you can wire whisper directly without it — the Python filter is cross-platform:
+```cmd
+whisper-stream.exe -m models\ggml-base.en.bin -c -1 -t 6 ^
+    --step 700 --length 5000 --keep 200 2>whisper.log ^
+    | python caption_filter.py C:\Temp\caption.txt
+```
+Then run the producer with `--caption-file C:\Temp\caption.txt` (or set `CAPTION_FILE` in your environment). Pick a specific input device with `-c <SDL index>` — the indices are listed in `whisper.log` after startup (look for `Capture device #N: '<name>'`).
 
 > **The `service`/`door` binaries** build for Linux, macOS, Windows, FreeBSD, OpenBSD × amd64/arm64 (plus 386 on Linux/Windows). They run on the BBS box — see below.
 
@@ -174,8 +182,8 @@ ffmpeg <input flags above> -pix_fmt bgr24 -s 640x480 -f rawvideo - \
 
 First install whisper.cpp's `whisper-stream`:
 - **macOS:** `brew install whisper-cpp`
-- **Linux:** your distro package if available, otherwise build from [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (`cmake -B build -DWHISPER_SDL2=ON && cmake --build build`)
-- **Windows:** prebuilt releases from the whisper.cpp repo, or build it
+- **Linux:** your distro package if available, otherwise build from [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`cmake -B build -DWHISPER_SDL2=ON && cmake --build build`)
+- **Windows (32 or 64-bit):** grab a prebuilt zip from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) — use `whisper-blas-bin-Win32.zip` for 32-bit Windows or `whisper-blas-bin-x64.zip` for 64-bit. (The `blas` variants are BLAS-accelerated and faster than plain.) Extract; the zip contains `whisper-stream.exe`, `SDL2.dll`, and the other tools — no compile needed. Add the `Release\` folder to your `PATH` (or call `whisper-stream.exe` by full path).
 
 ```bash
 ./models/download.sh            # base.en model (or: small.en for accuracy)
