@@ -20,9 +20,16 @@ import select
 import socket
 import ssl
 import sys
-import termios
 import time
-import tty
+
+# termios/tty are Unix-only. On Windows we just skip the interactive mirror.
+try:
+    import termios
+    import tty
+    _HAVE_TTY = True
+except ImportError:
+    termios = tty = None
+    _HAVE_TTY = False
 
 import cv2
 import numpy as np
@@ -141,7 +148,7 @@ def main():
     use_test = source == "test"
     use_stdin = source == "-"
     # stdin carries the video for "-", so it can't also drive the mirror keys.
-    interactive = (args.mirror and not use_stdin
+    interactive = (args.mirror and not use_stdin and _HAVE_TTY
                    and sys.stdin.isatty() and sys.stdout.isatty())
     # Auto-mirror only the default selfie webcam. Explicit devices (incl. HDMI
     # capture cards by index), files, URLs and pipes keep their real orientation.

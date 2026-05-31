@@ -40,7 +40,35 @@ cp .env.example .env          # set BBS_HOST, BBS_PORT, TOKEN, ...
 
 Mirror keys: `+/-` saturation · `[ ]` contrast · `< >` brightness · `m` half-block↔ramp · `g` ramp glyphs · `q` quit.
 
-> **Platforms.** The `service`/`door` binaries build for Linux, macOS, and Windows (the BBS box). The home-side launchers (`stream.sh`, `live.sh`, …) are bash, so they run on macOS/Linux as-is; on Windows use WSL or Git Bash, or just run the Python directly (`python producer.py --host … --token …`) — there the venv lives at `.venv\Scripts\`.
+#### Home — on Windows (32-bit or 64-bit)
+
+The producer is Python and runs on Windows; the bash launchers (`stream.sh`, etc.) don't, so you invoke `producer.py` directly. Steps from a fresh Windows box:
+
+1. **Install Python 3** for Windows — the official installer (`x86` for 32-bit Windows, `x64` for 64-bit) from <https://www.python.org/downloads/windows/>. Tick **"Add Python to PATH"** in the installer.
+2. **Install Git for Windows** (matches your bitness) — for `git clone`. It also includes Git Bash, in case you'd rather run the `.sh` launchers.
+3. Clone, set up the venv, install deps:
+   ```cmd
+   git clone https://github.com/hmderdoc/telnetvision.git
+   cd telnetvision
+   py -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements.txt
+   copy .env.example .env
+   ```
+   Then edit `.env` and fill in `BBS_HOST`, `BBS_PORT`, `TOKEN`. **On 32-bit Windows** specifically, pip may not find wheels for the latest `opencv-python`/`numpy` — pin a known-compatible older combo:
+   ```cmd
+   pip install "opencv-python==4.8.1.78" "numpy<2"
+   ```
+4. Run the producer (one line; flags map 1:1 to `.env` keys, since `stream.sh`'s `.env` loader is bash):
+   ```cmd
+   python producer.py --host YOUR_BBS_HOST --port 7600 --token YOUR_TOKEN ^
+       --channel cam --cols 80 --rows 24 --tls --insecure --source camera
+   ```
+   The live mirror (the `+/- m g q` keys) is **auto-disabled on Windows** because it relies on Unix TTY APIs — the stream itself works fine without it.
+
+For live mic captions on Windows you also need whisper.cpp's `whisper-stream` — prebuilt Windows releases or build from <https://github.com/ggerganov/whisper.cpp>. The `caption-mic.sh` launcher is bash; run it under Git Bash, or invoke `whisper-stream` directly and write its output to the file you set as `CAPTION_FILE`.
+
+> **The `service`/`door` binaries** build for Linux, macOS, Windows, FreeBSD, OpenBSD × amd64/arm64 (plus 386 on Linux/Windows). They run on the BBS box — see below.
 
 ### BBS / cloud side
 
