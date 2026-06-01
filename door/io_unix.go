@@ -1,17 +1,21 @@
 //go:build unix
 
-// Non-blocking stdin/stdout for the latency pacer (Linux, macOS, *BSD).
+// Non-blocking I/O against an arbitrary *os.File — stdio in normal mode, the
+// inherited DOOR32.SYS socket in EleBBS-style mode.
 package main
 
-import "syscall"
+import (
+	"os"
+	"syscall"
+)
 
-func setNonblock(fd int) { _ = syscall.SetNonblock(fd, true) }
-func setBlock(fd int)    { _ = syscall.SetNonblock(fd, false) }
+func setNonblock(f *os.File) { _ = syscall.SetNonblock(int(f.Fd()), true) }
+func setBlock(f *os.File)    { _ = syscall.SetNonblock(int(f.Fd()), false) }
 
 // writeNB writes without blocking. A would-block is reported as no error with
-// the buffer not fully consumed, so the caller just retries on the next tick.
-func writeNB(fd int, b []byte) (int, error) {
-	n, err := syscall.Write(fd, b)
+// the buffer not fully consumed, so the caller retries on the next tick.
+func writeNB(f *os.File, b []byte) (int, error) {
+	n, err := syscall.Write(int(f.Fd()), b)
 	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 		err = nil
 	}
@@ -21,9 +25,9 @@ func writeNB(fd int, b []byte) (int, error) {
 	return n, err
 }
 
-// readStdin reads from fd 0; again=true means "no input right now".
-func readStdin(b []byte) (n int, again bool, err error) {
-	n, err = syscall.Read(0, b)
+// readInput reads from f; again=true means "no input right now".
+func readInput(f *os.File, b []byte) (n int, again bool, err error) {
+	n, err = syscall.Read(int(f.Fd()), b)
 	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 		return 0, true, nil
 	}

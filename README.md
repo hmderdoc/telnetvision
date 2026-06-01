@@ -80,7 +80,12 @@ Then run the producer with `--caption-file C:\Temp\caption.txt` (or set `CAPTION
 
 ### BBS / cloud side
 
-Download the release bundle for your OS/arch (or build — see below) and follow **[packaging/INSTALL.md](packaging/INSTALL.md)**. In short: run `service` as a daemon (listens for the producer on `:7600`, for doors on `127.0.0.1:7601`), open only `:7600` inbound, and add `door` as a Synchronet external program (Intercept Standard I/O = Yes, Multiple Concurrent Users = Yes).
+Download the release bundle for your OS/arch (or build — see below) and follow **[packaging/INSTALL.md](packaging/INSTALL.md)**. In short: run `service` as a daemon (listens for the producer on `:7600`, for doors on `127.0.0.1:7601`), open only `:7600` inbound, and add `door` as an external program in your BBS.
+
+Two integration paths, both work without rebuilding:
+
+- **Synchronet** — add the door with *Intercept Standard I/O = Yes* and *Multiple Concurrent Users = Yes*. The BBS bridges the door's stdin/stdout to the caller's connection. Full steps in INSTALL.md §6.
+- **RA-family BBSes** (EleBBS, RemoteAccess, Mystic, MagickaBBS, …) — configure the door as a regular external program with `DOOR32.SYS` as the dropfile format. The door auto-detects the dropfile, picks up the inherited socket handle (DOOR32.SYS line 2 when line 1 is `2`/telnet), and talks to it directly. No stdio intercept needed. Details in INSTALL.md §"Other BBS packages (DOOR32.SYS)".
 
 ## Configuration
 

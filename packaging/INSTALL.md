@@ -118,3 +118,26 @@ Connect to the BBS in SyncTERM and launch **Telnetvision** from the doors menu.
 - **Look tuning** (only affects `-cp437`): `door -saturation 2.2`, `door -dither=false`.
 - If the door exits the instant a caller launches it, that's stdin-EOF handling under
   Synchronet's I/O intercept — flag it and it's a quick fix.
+
+---
+
+## Other BBS packages (DOOR32.SYS)
+
+For BBSes outside the Synchronet family — EleBBS, RemoteAccess, Mystic, MagickaBBS, anything in the RA lineage — the door auto-detects a `DOOR32.SYS` dropfile in its working directory at launch. When line 1 is `2` (telnet socket), the door reads and writes the already-open socket the BBS inherited to it (handle on line 2) instead of stdin/stdout. No stdio-intercept toggle, no telnet redirector, no flags needed.
+
+**Setup in your BBS's external-program config:**
+
+| Field | Value |
+|---|---|
+| Working directory | the door's install folder (where `door` / `door.exe` + `door.ini` live) |
+| Dropfile format | `DOOR32.SYS` — if your BBS offers a choice, pick this one |
+| Command line | `door` (or `door.exe`) — no flags needed; the dropfile is auto-detected |
+| Stdio intercept toggle | leave OFF if your BBS has one (irrelevant in socket mode) |
+| Multi-node | allowed — each caller spawns a fresh process with their own socket |
+
+The door's `host`/`port`/`channel`/`encoding`/`color` settings still come from `door.ini` exactly as they do under Synchronet — the only thing DOOR32.SYS mode changes is *where the caller's bytes flow*. Pass `-door32 ""` to force stdio mode for testing.
+
+### Tested combinations
+
+- **Synchronet (stdio path)** — primary deployment, exercised in the steps above.
+- **DOOR32.SYS socket inheritance** — implemented to the RA-published spec and verified on Linux/macOS with a synthetic harness that feeds an inherited Unix socket through end-to-end (auto-detect → wrap → render to socket → input from socket). **First real-world integration target: EleBBS on Windows.** Windows uses Go's `os.NewFile` to wrap the SOCKET handle, which works for plain blocking sockets (what `accept()` returns by default) but may need adjustment for BBSes that pass `WSA_FLAG_OVERLAPPED` sockets. If launch fails with I/O errors in the door's `debug` log, file an issue with the BBS package name + version + a redacted copy of the `DOOR32.SYS` your BBS dropped.

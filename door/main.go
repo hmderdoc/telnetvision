@@ -371,6 +371,8 @@ func main() {
 	frames := flag.Int("frames", 0, "exit after N rendered frames (0=forever)")
 	iniPath := flag.String("ini", defaultINIPath(), "optional .ini config (read at launch)")
 	debugPath := flag.String("debug", "", "write a diagnostic log to this file (e.g. to debug input)")
+	door32Path := flag.String("door32", "DOOR32.SYS",
+		"path to DOOR32.SYS dropfile (auto-used when present); empty string disables")
 	flag.Parse()
 
 	// .ini fills in any setting not given explicitly on the command line, so
@@ -434,6 +436,32 @@ func main() {
 		}
 	}
 
+	// DOOR32.SYS: if the BBS dropped one and line 1 == 2 (telnet), the caller's
+	// socket has been inherited to us — talk to it directly instead of stdio.
+	// Anything else (missing file, comm type != telnet) falls back to stdio.
+	input, output := os.Stdin, os.Stdout
+	if *door32Path != "" {
+		info, err := readDoor32(*door32Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "door32: %v\n", err)
+			os.Exit(1)
+		}
+		if info != nil && info.Comm == door32CommTelnet {
+			sf := os.NewFile(uintptr(info.Handle), "door32-socket")
+			if sf == nil {
+				fmt.Fprintf(os.Stderr, "door32: cannot wrap socket handle %d\n", info.Handle)
+				os.Exit(1)
+			}
+			input, output = sf, sf
+			if dbg != nil {
+				dbg.Printf("door32: telnet socket handle=%d bbsid=%q user=%q node=%d",
+					info.Handle, info.BBSID, info.User, info.Node)
+			}
+		} else if info != nil && dbg != nil {
+			dbg.Printf("door32: comm type=%d (not telnet) — falling back to stdio", info.Comm)
+		}
+	}
+
 	// The two axes are independent: glyph encoding vs color depth.
 	cp437enc := strings.EqualFold(*encoding, "cp437")
 	glyph := []byte("▀") // U+2580, for UTF-8 terminals
@@ -457,7 +485,7 @@ func main() {
 	}
 
 	restoreTTY := ttyRaw() // single-key input; no-op if stdin isn't a tty
-	out := os.Stdout
+	out := output
 	// Hide cursor + DISABLE auto-wrap (DECAWM). With auto-wrap on, writing the
 	// last cell of the bottom row (the caption bar fills it every frame) makes
 	// the terminal scroll up one line — that's the row-count-dependent glitch.
@@ -466,7 +494,7 @@ func main() {
 	quit := func(code int) {
 		once.Do(func() {
 			restoreTTY()
-			setBlock(int(out.Fd())) // restore blocking so cleanup flushes
+			setBlock(out) // restore blocking so cleanup flushes
 			fmt.Fprint(out, "\x1b[?7h\x1b[0m\x1b[?25h\n") // re-enable auto-wrap
 		})
 		os.Exit(code)
@@ -476,34 +504,35 @@ func main() {
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigc; quit(0) }()
 
-	go func() { // q/Q/ESC/Ctrl-C, or stdin EOF (caller disconnect), ends the door
+	go func() { // q/Q/ESC/Ctrl-C, or input EOF (caller disconnect), ends the door
 		if dbg != nil {
-			dbg.Printf("stdin reader started (fd 0)")
+			dbg.Printf("input reader started (fd %d)", input.Fd())
 		}
 		b := make([]byte, 1)
 		for {
-			n, again, err := readStdin(b)
-			// stdin usually shares its open-file flags with stdout, which we set
-			// non-blocking for the output pacer — so "no data" just means "no key
-			// right now", NOT disconnect. Poll instead of quitting.
+			n, again, err := readInput(input, b)
+			// In stdio mode, stdin usually shares its open-file flags with stdout
+			// (which we set non-blocking for the output pacer); in DOOR32 socket
+			// mode input == output. Either way "no data" just means "no key right
+			// now", NOT disconnect — poll instead of quitting.
 			if again {
 				time.Sleep(20 * time.Millisecond)
 				continue
 			}
 			if err != nil {
 				if dbg != nil {
-					dbg.Printf("stdin read error: %v (exiting)", err)
+					dbg.Printf("input read error: %v (exiting)", err)
 				}
 				quit(0)
 			}
 			if n == 0 { // EOF: caller disconnected
 				if dbg != nil {
-					dbg.Printf("stdin EOF (exiting)")
+					dbg.Printf("input EOF (exiting)")
 				}
 				quit(0)
 			}
 			if dbg != nil {
-				dbg.Printf("stdin byte: %d", b[0])
+				dbg.Printf("input byte: %d", b[0])
 			}
 			switch b[0] {
 			case 'q', 'Q', 27, 3: // 27 = ESC, 3 = Ctrl-C
@@ -536,8 +565,7 @@ func main() {
 	// Non-blocking output: we write a frame only once the previous one has fully
 	// drained, and drop everything in between. This bounds latency to ~one frame
 	// in flight instead of letting stale frames pile up in the caller's buffer.
-	fd := int(out.Fd())
-	setNonblock(fd)
+	setNonblock(out)
 
 	var prev []byte
 	renderSig := ""
@@ -558,7 +586,7 @@ func main() {
 
 		// 1. Keep flushing the in-flight frame (non-blocking).
 		if pending != nil {
-			n, werr := writeNB(fd, pending[pendingOff:])
+			n, werr := writeNB(out, pending[pendingOff:])
 			if n > 0 {
 				pendingOff += n
 				didWork = true
