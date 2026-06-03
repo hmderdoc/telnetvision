@@ -13,7 +13,7 @@ this one transcribes the source's audio (when the source has audio).
 
 Env (all optional):
   SOURCE         URL/file/path (falls back to argv[1])
-  CAPTION_FILE   /tmp/caption.txt
+  CAPTION_FILE   <tempdir>/caption.txt  (/tmp on Linux/macOS, %TEMP% on Windows)
   CAPTION_MODEL  base.en   (resolved as models/ggml-<name>.bin if not a path)
   CHUNK_SECS     5         (lower = less latency, lower accuracy)
   WHISPER_BIN    whisper-cli
@@ -59,7 +59,9 @@ def transcribe(wav_path: str, model: str, whisper_bin: str, threads: int) -> str
     cmd = [whisper_bin, "-m", model, "-f", wav_path,
            "-nt", "-np", "-sns", "-l", "en", "-t", str(threads)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        # whisper-cli writes UTF-8; pin it so Windows doesn't fall back to cp1252.
+        r = subprocess.run(cmd, capture_output=True, timeout=60,
+                           encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired:
         return ""
     if r.returncode != 0:
@@ -85,7 +87,10 @@ def main() -> int:
     if not source:
         sys.exit("caption-source: SOURCE is required (env or argv[1]).\n"
                  "  example: caption-source.py http://192.168.0.23:5005/auto/v2.1")
-    caption_file = os.environ.get("CAPTION_FILE", "/tmp/caption.txt")
+    # Cross-platform default: /tmp on Unix, %TEMP% on Windows. Most users will
+    # set CAPTION_FILE explicitly to keep producer + caption-source in sync.
+    default_caption = str(Path(tempfile.gettempdir()) / "caption.txt")
+    caption_file = os.environ.get("CAPTION_FILE", default_caption)
     model = resolve_model(os.environ.get("CAPTION_MODEL", "base.en"))
     chunk_secs = float(os.environ.get("CHUNK_SECS", "5"))
     whisper_bin = os.environ.get("WHISPER_BIN", "whisper-cli")
@@ -111,9 +116,33 @@ def main() -> int:
             pass
         sys.exit(0)
     signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
+    # SIGTERM exists on Windows Python but is never raised by the OS — and on
+    # some Python/Windows combos signal.signal(SIGTERM, ...) raises ValueError.
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except (ValueError, AttributeError):
+        pass
+
+    def flush(chunk: bytes) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = tf.name
+        try:
+            with wave.open(wav_path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(BYTES_PER_SAMPLE)
+                w.setframerate(SAMPLE_RATE)
+                w.writeframes(chunk)
+            text = transcribe(wav_path, model, whisper_bin, threads)
+            if text:
+                write_caption(caption_file, text)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
     buf = bytearray()
+    min_tail = SAMPLE_RATE * BYTES_PER_SAMPLE // 2  # 0.5s — anything shorter is noise
     try:
         while True:
             data = ff.stdout.read(8192)
@@ -124,22 +153,11 @@ def main() -> int:
             buf.extend(data)
             while len(buf) >= chunk_bytes:
                 chunk, buf = bytes(buf[:chunk_bytes]), bytearray(buf[chunk_bytes:])
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                    wav_path = tf.name
-                try:
-                    with wave.open(wav_path, "wb") as w:
-                        w.setnchannels(1)
-                        w.setsampwidth(BYTES_PER_SAMPLE)
-                        w.setframerate(SAMPLE_RATE)
-                        w.writeframes(chunk)
-                    text = transcribe(wav_path, model, whisper_bin, threads)
-                    if text:
-                        write_caption(caption_file, text)
-                finally:
-                    try:
-                        os.unlink(wav_path)
-                    except OSError:
-                        pass
+                flush(chunk)
+        # Trailing audio shorter than CHUNK_SECS (the whole input, for short
+        # files; the final partial window, for any file): transcribe it too.
+        if len(buf) >= min_tail:
+            flush(bytes(buf))
     finally:
         try:
             ff.terminate()
