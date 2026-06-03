@@ -201,6 +201,21 @@ First install whisper.cpp's `whisper-stream`:
 
 Pick the audio input with `CAPTURE=<index>` or `CAPTURE="<name substring>"` — the latter is **resilient when devices shuffle** (e.g. AirPods toggling reorders SDL indices), at the cost of a ~10s discovery on startup. `LIST=1 ./caption-mic.sh` dumps the current device list cleanly so you don't have to fish through `/tmp/whisper.log`. If captions read `[Music]`/`[sound effects]`, you're on the wrong input — see Troubleshooting.
 
+### Captioning the source's own audio (no mic)
+
+When `SOURCE` is a URL or file that carries its own audio — HDHomeRun MPEG-TS, RTSP cameras, mp4 files, anything ffmpeg can read — [`caption-source.py`](caption-source.py) demuxes that audio, chunks it, runs `whisper-cli` per chunk, and writes the cleaned transcription into `CAPTION_FILE`. The producer is already broadcasting that file, so nothing on the producer side has to change. This is the path to use when there's no local mic, or when you want to caption the *content* rather than the broadcaster.
+
+Prerequisites: `ffmpeg` and `whisper-cli` on `PATH` (the prebuilt whisper.cpp Windows zip ships `whisper-cli.exe` alongside `whisper-stream.exe`), and a model under `models/`.
+
+```bash
+SOURCE=http://192.168.0.23:5005/auto/v2.1 python caption-source.py
+SOURCE=clip.mp4 CAPTION_MODEL=small.en CHUNK_SECS=8 python caption-source.py
+```
+
+Latency is roughly `CHUNK_SECS` + transcribe time (~1–3s on CPU for `base.en`), so 5–8s end-to-end — fine for BBS captioning. Larger chunks = more accurate but laggier; smaller = snappier but choppier mid-sentence.
+
+Note: the producer is also consuming `SOURCE` for video. Most HTTP/RTSP endpoints allow concurrent consumers; some HDHomeRun configurations don't — if you hit "device busy" errors, point one of them at a local tee or recording instead.
+
 ## Building from source
 
 ```bash
@@ -216,7 +231,9 @@ Go cross-compiles to Linux/macOS/Windows × amd64/arm64; the release workflow bu
 producer.py        capture → grade → downscale → push (home)
 ascii_cam.py       standalone local viewer (no streaming)
 wire.py            wire protocol (framing, FRAME format)
-caption_filter.py  whisper-stream output → current-caption file
+caption_filter.py  shared text-cleaning (drops [Music], ANSI, timestamps...)
+caption-mic.sh     whisper-stream on local mic → CAPTION_FILE
+caption-source.py  ffmpeg-demux SOURCE audio → whisper-cli chunks → CAPTION_FILE
 service/           Go fanout relay (cloud)
 door/              Go per-caller renderer (BBS); io_{unix,windows}.go
 packaging/         INSTALL.md, door.ini, telnetvision.service (systemd)
