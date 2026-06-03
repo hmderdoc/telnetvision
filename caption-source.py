@@ -28,6 +28,7 @@ Note: the producer is also consuming SOURCE for video. Most HTTP/RTSP sources
 allow concurrent consumers; if yours doesn't (some HDHomeRun endpoints don't),
 point one of them at a local tee or a recording instead."""
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -50,8 +51,23 @@ def resolve_model(name: str) -> str:
     p = here / "models" / f"ggml-{name}.bin"
     if p.is_file():
         return str(p)
+    on_windows = sys.platform == "win32"
+    dl = "models\\download.bat" if on_windows else "./models/download.sh"
     sys.exit(f"caption-source: model not found: {name} (looked at: {p})\n"
-             f"  download one: ./models/download.sh base.en")
+             f"  download one: {dl} base.en")
+
+
+def require_binary(name: str, env_var: str, hint: str) -> str:
+    """Check that an external binary is on PATH (or pointed at by env_var) and
+    return the resolved path. Errors out with an actionable message instead of
+    letting subprocess raise FileNotFoundError on launch."""
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    sys.exit(
+        f"caption-source: {name!r} not found on PATH.\n"
+        f"  {hint}\n"
+        f"  Or set {env_var}=<full path to the binary> and re-run.")
 
 
 def transcribe(wav_path: str, model: str, whisper_bin: str, threads: int) -> str:
@@ -97,6 +113,18 @@ def main() -> int:
     ffmpeg = os.environ.get("FFMPEG", "ffmpeg")
     threads = int(os.environ.get("THREADS", "4"))
     chunk_bytes = int(chunk_secs * SAMPLE_RATE * BYTES_PER_SAMPLE)
+
+    # Fail fast with an actionable message — the alternative is a multi-line
+    # Python traceback ending in "WinError 2" that's hard to map back to "you
+    # need to install ffmpeg".
+    ffmpeg = require_binary(ffmpeg, "FFMPEG",
+        "Install ffmpeg: https://www.gyan.dev/ffmpeg/builds/ (Windows: "
+        "'release essentials' zip; extract; add the bin\\ folder to PATH). "
+        "macOS: 'brew install ffmpeg'. Linux: your distro's ffmpeg package.")
+    whisper_bin = require_binary(whisper_bin, "WHISPER_BIN",
+        "Install whisper.cpp: https://github.com/ggml-org/whisper.cpp/releases "
+        "(Windows: 'whisper-blas-bin-x64.zip' or '-Win32.zip'; extract; add "
+        "the Release\\ folder to PATH). macOS: 'brew install whisper-cpp'.")
 
     sys.stderr.write(
         f"caption-source: source={source!r} chunk={chunk_secs}s "

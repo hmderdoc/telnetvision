@@ -207,7 +207,12 @@ Pick the audio input with `CAPTURE=<index>` or `CAPTURE="<name substring>"` — 
 
 When `SOURCE` is a URL or file that carries its own audio — HDHomeRun MPEG-TS, RTSP cameras, mp4 files, anything ffmpeg can read — [`caption-source.py`](caption-source.py) demuxes that audio, chunks it, runs `whisper-cli` per chunk, and writes the cleaned transcription into `CAPTION_FILE`. The producer is already broadcasting that file, so nothing on the producer side has to change. This is the path to use when there's no local mic, or when you want to caption the *content* rather than the broadcaster.
 
-Prerequisites: `ffmpeg` and `whisper-cli` on `PATH` (the prebuilt whisper.cpp Windows zip ships `whisper-cli.exe` alongside `whisper-stream.exe`), and a model under `models/`.
+Prerequisites:
+- **`ffmpeg`** on `PATH` — separate install from whisper. macOS: `brew install ffmpeg`. Linux: your distro's package. Windows: grab the "release essentials" zip from <https://www.gyan.dev/ffmpeg/builds/>, extract, and add the `bin\` folder to `PATH`.
+- **`whisper-cli`** on `PATH` — bundled in whisper.cpp; the prebuilt Windows zip ships `whisper-cli.exe` alongside `whisper-stream.exe`.
+- A model in `models/` (`./models/download.sh base.en` on Unix, `models\download.bat base.en` on Windows).
+
+(If either binary is missing the script fails fast with an install pointer rather than a Python stacktrace.)
 
 ```bash
 SOURCE=http://192.168.0.23:5005/auto/v2.1 python caption-source.py
