@@ -199,6 +199,8 @@ First install whisper.cpp's `whisper-stream`:
 ./live.sh                       # stream + mic captions in one command (bash; macOS/Linux)
 ```
 
+On Windows, the equivalent (no bash required) is `models\download.bat base.en`, or if `curl.exe` isn't on PATH, the PowerShell `Invoke-WebRequest` form in that script's header.
+
 Pick the audio input with `CAPTURE=<index>` or `CAPTURE="<name substring>"` — the latter is **resilient when devices shuffle** (e.g. AirPods toggling reorders SDL indices), at the cost of a ~10s discovery on startup. `LIST=1 ./caption-mic.sh` dumps the current device list cleanly so you don't have to fish through `/tmp/whisper.log`. If captions read `[Music]`/`[sound effects]`, you're on the wrong input — see Troubleshooting.
 
 ### Captioning the source's own audio (no mic)
