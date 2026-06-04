@@ -65,6 +65,12 @@ def open_capture(source, camera):
     cap = cv2.VideoCapture(target)
     if not cap.isOpened():
         raise SystemExit(f"cannot open source: {source!r}")
+    # Cap the backend's input buffer to a single frame. We're already running
+    # at a lower fps than most sources push, so without this OpenCV/FFmpeg
+    # queues frames the BBS can never catch up to — wastes memory (matters on
+    # 32-bit Python with HD sources like HDHomeRun) and adds latency. Returns
+    # False on backends that don't support it; harmless either way.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 

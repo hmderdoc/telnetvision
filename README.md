@@ -44,7 +44,7 @@ Mirror keys: `+/-` saturation · `[ ]` contrast · `< >` brightness · `m` half-
 
 The producer is Python and runs on Windows; the bash launchers (`stream.sh`, etc.) don't, so you invoke `producer.py` directly. Steps from a fresh Windows box:
 
-1. **Install Python 3** for Windows — the official installer (`x86` for 32-bit Windows, `x64` for 64-bit) from <https://www.python.org/downloads/windows/>. Tick **"Add Python to PATH"** in the installer.
+1. **Install Python 3** for Windows — the official installer from <https://www.python.org/downloads/windows/>. Tick **"Add Python to PATH"** in the installer. **Prefer the 64-bit (`x64`) installer** even on 64-bit Windows running a 32-bit BBS — Python's bitness is independent of EleBBS/Synchronet's. The 32-bit installer is fine for a webcam at 640×480, but **HD stream sources (HDHomeRun MPEG-TS, RTSP HD cameras, 1080p files) routinely exhaust 32-bit Python's ~2 GB address space** as OpenCV's FFmpeg backend buffers decode state. If you see `cv2` allocation/OOM errors with an HD source, this is almost always the cause; 64-bit Python fixes it directly.
 2. **Install Git for Windows** (matches your bitness) — for `git clone`. It also includes Git Bash, in case you'd rather run the `.sh` launchers.
 3. Clone, set up the venv, install deps:
    ```cmd
