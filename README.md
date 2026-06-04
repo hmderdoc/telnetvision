@@ -59,11 +59,18 @@ The producer is Python and runs on Windows; the bash launchers (`stream.sh`, etc
    ```cmd
    pip install "opencv-python==4.8.1.78" "numpy<2"
    ```
-4. Run the producer (one line; flags map 1:1 to `.env` keys, since `stream.sh`'s `.env` loader is bash):
-   ```cmd
-   python producer.py --host YOUR_BBS_HOST --port 7600 --token YOUR_TOKEN ^
-       --channel cam --cols 80 --rows 24 --tls --insecure --source camera
-   ```
+4. Run the producer. Two paths:
+   - **Webcam / 32-bit Python is fine** — invoke `producer.py` directly (one line; flags map 1:1 to `.env` keys, since `stream.sh`'s `.env` loader is bash):
+     ```cmd
+     python producer.py --host YOUR_BBS_HOST --port 7600 --token YOUR_TOKEN ^
+         --channel cam --cols 80 --rows 24 --tls --insecure --source camera
+     ```
+   - **HD stream source (HDHomeRun MPEG-TS, RTSP camera, 1080p file)** — use `stream-source.bat` instead. It does ffmpeg-side pre-downscale to the door's cell grid before piping into the producer, so Python never touches a full HD frame. **Required on 32-bit Python or 32-bit Windows** (an undownscaled 1080p stream will OOM opencv-python in the 2 GB address space); useful everywhere else for lower memory + latency. Reads the same `.env`; `SOURCE` from env, `.env`, or argv[1]:
+     ```cmd
+     stream-source.bat http://192.168.0.23:5005/auto/v2.1
+     ```
+     Prerequisite: `ffmpeg.exe` on PATH (see Live captions section for the install pointer).
+
    The live mirror (the `+/- m g q` keys) is **auto-disabled on Windows** because it relies on Unix TTY APIs — the stream itself works fine without it.
 
 For live mic captions on Windows you also need **whisper.cpp's `whisper-stream.exe`**. Grab a prebuilt zip from <https://github.com/ggml-org/whisper.cpp/releases> — pick `whisper-blas-bin-Win32.zip` (32-bit) or `whisper-blas-bin-x64.zip` (64-bit). Extract it; the zip ships `whisper-stream.exe`, `SDL2.dll`, and a ggml model is downloaded separately. Grab a model the same way the Mac/Linux side does — `ggml-base.en.bin` from <https://huggingface.co/ggerganov/whisper.cpp> works.
