@@ -20,6 +20,7 @@ import select
 import socket
 import ssl
 import sys
+import threading
 import time
 
 # termios/tty are Unix-only. On Windows we just skip the interactive mirror.
@@ -57,20 +58,21 @@ def parse_size(s):
 def open_capture(source, camera):
     """cv2.VideoCapture for a device index, file path, or URL (rtsp/http/...)."""
     if source == "camera":
-        target = camera
+        target, is_device = camera, True
     elif source.isdigit():
-        target = int(source)  # e.g. an OBS virtual-camera index
+        target, is_device = int(source), True  # USB cam, HDMI capture, OBS virtual cam
     else:
-        target = source       # file path or stream URL
+        target, is_device = source, False      # file path or stream URL
     cap = cv2.VideoCapture(target)
     if not cap.isOpened():
         raise SystemExit(f"cannot open source: {source!r}")
-    # Cap the backend's input buffer to a single frame. We're already running
-    # at a lower fps than most sources push, so without this OpenCV/FFmpeg
-    # queues frames the BBS can never catch up to — wastes memory (matters on
-    # 32-bit Python with HD sources like HDHomeRun) and adds latency. Returns
-    # False on backends that don't support it; harmless either way.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Cap the FFmpeg/HTTP backend's input buffer to a single frame so a slow
+    # consumer doesn't let stream frames pile up. Skip for device captures
+    # (webcam, HDMI card, OBS virtual cam): the AVFoundation/DSHOW/V4L2
+    # backends don't accumulate that way, and on macOS AVFoundation a
+    # BUFFERSIZE set on a capture device can stall the read pipeline.
+    if not is_device:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
@@ -99,6 +101,79 @@ def read_caption(path):
         return b""
     lines = [ln.strip() for ln in tail.decode("utf-8", "replace").splitlines() if ln.strip()]
     return (lines[-1] if lines else "")[:240].encode("utf-8", "replace")
+
+
+class Diag:
+    """Per-phase timing + a watchdog that fires the moment any phase blocks
+    longer than `stuck_after` seconds. Only created when --diag-file is set;
+    when unset, the NullDiag below makes the call sites no-ops.
+
+    Heartbeat every `heartbeat` seconds: one line with frames-per-window, fps,
+    and the max wall-clock duration observed for each phase that ran in the
+    window. Watchdog runs in a daemon thread checking the current phase every
+    0.5 s — if a freeze happens, the *last* line of the diag file names the
+    phase and how long it's been stuck."""
+
+    def __init__(self, path, stuck_after=3.0, heartbeat=2.0):
+        self.f = open(path, "a", buffering=1)
+        self.phase = "init"
+        self.phase_t = time.monotonic()
+        self.frame_count = 0
+        self.phase_max = {}
+        self.last_hb = time.monotonic()
+        self.last_alert = ("", 0.0)
+        self.stuck_after = stuck_after
+        self.heartbeat = heartbeat
+        self._log(f"diag start  pid={os.getpid()}")
+        threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def _log(self, line):
+        try:
+            self.f.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+        except OSError:
+            pass
+
+    def set_phase(self, name):
+        now = time.monotonic()
+        prev_dt = now - self.phase_t
+        if self.phase != "init":
+            cur = self.phase_max.get(self.phase, 0.0)
+            if prev_dt > cur:
+                self.phase_max[self.phase] = prev_dt
+        self.phase = name
+        self.phase_t = now
+
+    def frame_done(self):
+        self.frame_count += 1
+        now = time.monotonic()
+        if now - self.last_hb < self.heartbeat:
+            return
+        maxes = self.phase_max
+        self.phase_max = {}
+        secs = now - self.last_hb
+        fps = self.frame_count / secs
+        self.frame_count = 0
+        self.last_hb = now
+        parts = " ".join(f"{k}={v * 1000:.1f}ms" for k, v in sorted(maxes.items()))
+        self._log(f"fps={fps:.1f} max {parts}")
+
+    def _watchdog(self):
+        while True:
+            time.sleep(0.5)
+            cur, started = self.phase, self.phase_t
+            stuck = time.monotonic() - started
+            if stuck < self.stuck_after or cur in ("init", "idle"):
+                continue
+            # Avoid spamming: re-alert only after another stuck_after seconds.
+            if self.last_alert[0] == cur and stuck - self.last_alert[1] < self.stuck_after:
+                continue
+            self._log(f"STUCK in phase {cur!r} for {stuck:.1f}s")
+            self.last_alert = (cur, stuck)
+
+
+class _NullDiag:
+    def set_phase(self, name): pass
+    def frame_done(self): pass
 
 
 def grade(bgr, brightness, contrast, saturation):
@@ -148,7 +223,11 @@ def main():
     ap.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=True,
                     help="live local preview + key controls (auto-off if not a TTY)")
     ap.add_argument("--frames", type=int, default=0, help="stop after N frames (0=forever)")
+    ap.add_argument("--diag-file", default="",
+                    help="write per-phase timings here every 2s; a watchdog logs "
+                         "'STUCK in phase X for Ys' if any phase blocks > 3s")
     args = ap.parse_args()
+    diag = Diag(args.diag_file) if args.diag_file else _NullDiag()
 
     source = args.source
     use_test = source == "test"
@@ -222,6 +301,7 @@ def main():
                 if quit_flag:
                     break
 
+            diag.set_phase("acquire")
             if use_test:
                 frame = test_frame(args.cols, args.rows, n)
             elif use_stdin:
@@ -240,6 +320,7 @@ def main():
                             break
                         continue
                 fails = 0
+            diag.set_phase("process")
             if do_flip:
                 frame = cv2.flip(frame, 1)
 
@@ -248,10 +329,12 @@ def main():
                 graded, (args.cols, 2 * args.rows), interpolation=cv2.INTER_AREA
             )
 
+            diag.set_phase("read_caption")
             caption = read_caption(args.caption_file)
 
             # Send full-color downscaled pixels (BGR->RGB) plus the render
             # directive and any caption, so callers see what you chose.
+            diag.set_phase("send")
             mode_i = 1 if mode == "ramp" else 0
             ramp_i = 1 if ramp == "shades" else 0
             pixels = np.ascontiguousarray(small[..., ::-1])
@@ -259,6 +342,7 @@ def main():
                 args.cols, args.rows, pixels.tobytes(), mode_i, ramp_i, caption))
 
             if interactive:
+                diag.set_phase("mirror")
                 if mode == "half":
                     art = ascii_cam.render_half(small)
                 else:
@@ -277,11 +361,13 @@ def main():
                 out.write(f"\033[{args.rows + 1};1H\033[K\033[7m{status[:args.cols]}\033[0m")
                 out.flush()
 
+            diag.frame_done()
             n += 1
             if args.frames and n >= args.frames:
                 break
             dt = time.monotonic() - t0
             if dt < interval:
+                diag.set_phase("idle")
                 time.sleep(interval - dt)
     except KeyboardInterrupt:
         pass
