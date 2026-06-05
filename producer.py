@@ -226,6 +226,9 @@ def main():
     ap.add_argument("--diag-file", default="",
                     help="write per-phase timings here every 2s; a watchdog logs "
                          "'STUCK in phase X for Ys' if any phase blocks > 3s")
+    ap.add_argument("--send-timeout", type=float, default=10.0,
+                    help="seconds before a wedged sendall() fails with TimeoutError "
+                         "instead of blocking forever (default: 10)")
     args = ap.parse_args()
     diag = Diag(args.diag_file) if args.diag_file else _NullDiag()
 
@@ -252,11 +255,16 @@ def main():
         cap = open_capture(source, args.camera)
 
     sock = connect(args)
+    # Bound any single socket operation. A wedged service used to leave
+    # sendall() blocked forever; with a timeout it raises TimeoutError so the
+    # producer can report and exit instead of looking alive but stuck.
+    sock.settimeout(args.send_timeout)
     wire.hello_producer(sock, args.token, args.channel)
 
-    sat, con, bri = args.saturation, args.contrast, args.brightness  # live-adjustable
-    mode = args.mode          # "half" | "ramp" — sent to callers
-    ramp = args.ramp          # "ascii" | "shades" — ramp glyphs when mode=ramp
+    # Live-adjustable state, shared with the stdin reader thread. Python's GIL
+    # makes single-key writes/reads atomic; we snapshot at the top of each frame.
+    ctl = {"sat": args.saturation, "con": args.contrast, "bri": args.brightness,
+           "mode": args.mode, "ramp": args.ramp, "quit": False}
 
     out = sys.stdout
     old_term = None
@@ -266,40 +274,46 @@ def main():
         out.write("\033[?25l\033[?7l\033[2J")  # hide cursor, disable auto-wrap, clear
         out.flush()
 
+        # Background stdin reader: keeps 'q' responsive even when the main loop
+        # is blocked in sendall(). On quit, we also shutdown the socket so a
+        # blocked send wakes up immediately with OSError instead of waiting out
+        # the send_timeout.
+        def stdin_reader():
+            while not ctl["quit"]:
+                try:
+                    chunk = os.read(sys.stdin.fileno(), 64)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                for k in chunk.decode("latin-1", "ignore"):
+                    if k in ("+", "="):   ctl["sat"] = round(min(3.0, ctl["sat"] + 0.1), 2)
+                    elif k in ("-", "_"): ctl["sat"] = round(max(0.0, ctl["sat"] - 0.1), 2)
+                    elif k == "]":        ctl["con"] = round(min(3.0, ctl["con"] + 0.1), 2)
+                    elif k == "[":        ctl["con"] = round(max(0.1, ctl["con"] - 0.1), 2)
+                    elif k in (".", ">"): ctl["bri"] = min(128, ctl["bri"] + 8)
+                    elif k in (",", "<"): ctl["bri"] = max(-128, ctl["bri"] - 8)
+                    elif k == "m":        ctl["mode"] = "ramp" if ctl["mode"] == "half" else "half"
+                    elif k == "g":        ctl["ramp"] = "shades" if ctl["ramp"] == "ascii" else "ascii"
+                    elif k == "0":        ctl["sat"], ctl["con"], ctl["bri"] = 1.0, 1.0, 0
+                    elif k in ("q", "Q"):
+                        ctl["quit"] = True
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        return
+
+        threading.Thread(target=stdin_reader, daemon=True).start()
+
     interval = 1.0 / args.fps
     n = 0
     fails = 0
-    quit_flag = False
     try:
-        while not quit_flag:
+        while not ctl["quit"]:
             t0 = time.monotonic()
-
-            if interactive:
-                # Raw fd read (not sys.stdin.read, which buffers past select).
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    for k in os.read(sys.stdin.fileno(), 64).decode("latin-1", "ignore"):
-                        if k in ("+", "="):
-                            sat = round(min(3.0, sat + 0.1), 2)
-                        elif k in ("-", "_"):
-                            sat = round(max(0.0, sat - 0.1), 2)
-                        elif k == "]":
-                            con = round(min(3.0, con + 0.1), 2)
-                        elif k == "[":
-                            con = round(max(0.1, con - 0.1), 2)
-                        elif k in (".", ">"):
-                            bri = min(128, bri + 8)
-                        elif k in (",", "<"):
-                            bri = max(-128, bri - 8)
-                        elif k == "m":
-                            mode = "ramp" if mode == "half" else "half"
-                        elif k == "g":
-                            ramp = "shades" if ramp == "ascii" else "ascii"
-                        elif k == "0":
-                            sat, con, bri = 1.0, 1.0, 0
-                        elif k in ("q", "Q"):
-                            quit_flag = True
-                if quit_flag:
-                    break
+            sat, con, bri = ctl["sat"], ctl["con"], ctl["bri"]
+            mode, ramp = ctl["mode"], ctl["ramp"]
 
             diag.set_phase("acquire")
             if use_test:
@@ -338,8 +352,21 @@ def main():
             mode_i = 1 if mode == "ramp" else 0
             ramp_i = 1 if ramp == "shades" else 0
             pixels = np.ascontiguousarray(small[..., ::-1])
-            wire.send_msg(sock, wire.frame_payload(
-                args.cols, args.rows, pixels.tobytes(), mode_i, ramp_i, caption))
+            try:
+                wire.send_msg(sock, wire.frame_payload(
+                    args.cols, args.rows, pixels.tobytes(), mode_i, ramp_i, caption))
+            except TimeoutError:
+                sys.stderr.write(
+                    f"\nproducer: send to {args.host}:{args.port} timed out after "
+                    f"{args.send_timeout:.0f}s — service stopped reading.\n"
+                    f"  on the cloud box: check the service is alive and not deadlocked\n"
+                    f"  (`kill -USR1 <service-pid>` dumps every goroutine's stack to its log)\n")
+                sys.exit(2)
+            except OSError as e:
+                if ctl["quit"]:
+                    break  # user pressed q; the stdin thread shut the socket down
+                sys.stderr.write(f"\nproducer: send failed: {e}\n")
+                sys.exit(2)
 
             if interactive:
                 diag.set_phase("mirror")

@@ -16,7 +16,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"runtime"
 	"sync"
+	"syscall"
 )
 
 const (
@@ -252,6 +256,22 @@ func listen(addr string, tlsCfg *tls.Config) (net.Listener, error) {
 	return net.Listen("tcp", addr)
 }
 
+// startStackDumper installs a SIGUSR1 handler that prints every goroutine's
+// stack to stderr. Run `kill -USR1 <pid>` against a wedged service to see
+// which goroutine is stuck where (lock, syscall, channel send/recv).
+func startStackDumper() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGUSR1)
+	go func() {
+		buf := make([]byte, 1<<20)
+		for range sigs {
+			n := runtime.Stack(buf, true)
+			log.Printf("===== SIGUSR1 stack dump (%d goroutines) =====\n%s\n===== end stack dump =====",
+				runtime.NumGoroutine(), buf[:n])
+		}
+	}()
+}
+
 func main() {
 	ingestAddr := flag.String("ingest", ":7600", "producer ingest listen address")
 	consumerAddr := flag.String("consumer", "127.0.0.1:7601", "consumer (door) listen address")
@@ -274,6 +294,14 @@ func main() {
 	}
 
 	h := newHub()
+
+	// SIGUSR1 -> dump every goroutine's stack. Cheap to install, no impact
+	// until fired. When the producer reports "STUCK in phase 'send'" the cause
+	// is here — `kill -USR1 <pid>` prints which goroutine is wedged where
+	// (lock, syscall, channel send). On platforms without SIGUSR1 the signal
+	// constant is undefined and the call would refuse, so it's Unix-only;
+	// on Windows the no-op is fine because we don't deploy the service there.
+	startStackDumper()
 
 	ingestLn, err := listen(*ingestAddr, ingestTLS)
 	if err != nil {
