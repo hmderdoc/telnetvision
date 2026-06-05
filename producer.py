@@ -226,9 +226,12 @@ def main():
     ap.add_argument("--diag-file", default="",
                     help="write per-phase timings here every 2s; a watchdog logs "
                          "'STUCK in phase X for Ys' if any phase blocks > 3s")
-    ap.add_argument("--send-timeout", type=float, default=10.0,
-                    help="seconds before a wedged sendall() fails with TimeoutError "
-                         "instead of blocking forever (default: 10)")
+    ap.add_argument("--send-timeout", type=float, default=15.0,
+                    help="seconds before a stalled sendall() fails with TimeoutError, "
+                         "which triggers a close+reconnect (NOT a process exit). "
+                         "0 disables — sendall can then block forever. Default 15s.")
+    ap.add_argument("--reconnect-max-delay", type=float, default=30.0,
+                    help="exponential backoff cap while reconnecting (s, default 30)")
     args = ap.parse_args()
     diag = Diag(args.diag_file) if args.diag_file else _NullDiag()
 
@@ -254,12 +257,19 @@ def main():
     elif not use_test:
         cap = open_capture(source, args.camera)
 
-    sock = connect(args)
-    # Bound any single socket operation. A wedged service used to leave
-    # sendall() blocked forever; with a timeout it raises TimeoutError so the
-    # producer can report and exit instead of looking alive but stuck.
-    sock.settimeout(args.send_timeout)
-    wire.hello_producer(sock, args.token, args.channel)
+    def establish():
+        """Open a fresh socket + send the producer hello. Returns the new
+        socket. Used at startup and whenever auto-reconnect fires."""
+        s = connect(args)
+        if args.send_timeout > 0:
+            s.settimeout(args.send_timeout)
+        wire.hello_producer(s, args.token, args.channel)
+        return s
+
+    # sock_holder lets the stdin-reader thread always see the current socket,
+    # so 'q' can shut down a connection that was just replaced by a reconnect.
+    sock = establish()
+    sock_holder = [sock]
 
     # Live-adjustable state, shared with the stdin reader thread. Python's GIL
     # makes single-key writes/reads atomic; we snapshot at the top of each frame.
@@ -299,7 +309,7 @@ def main():
                     elif k in ("q", "Q"):
                         ctl["quit"] = True
                         try:
-                            sock.shutdown(socket.SHUT_RDWR)
+                            sock_holder[0].shutdown(socket.SHUT_RDWR)
                         except OSError:
                             pass
                         return
@@ -355,18 +365,32 @@ def main():
             try:
                 wire.send_msg(sock, wire.frame_payload(
                     args.cols, args.rows, pixels.tobytes(), mode_i, ramp_i, caption))
-            except TimeoutError:
-                sys.stderr.write(
-                    f"\nproducer: send to {args.host}:{args.port} timed out after "
-                    f"{args.send_timeout:.0f}s — service stopped reading.\n"
-                    f"  on the cloud box: check the service is alive and not deadlocked\n"
-                    f"  (`kill -USR1 <service-pid>` dumps every goroutine's stack to its log)\n")
-                sys.exit(2)
-            except OSError as e:
+            except (TimeoutError, OSError) as e:
                 if ctl["quit"]:
                     break  # user pressed q; the stdin thread shut the socket down
-                sys.stderr.write(f"\nproducer: send failed: {e}\n")
-                sys.exit(2)
+                # Stalled or broken connection — close it and reconnect. This is
+                # the productionized version of "exit, restart, it works": fresh
+                # TCP/TLS state sidesteps whatever stuck the previous one (NAT
+                # conntrack drop, congestion-window collapse, server goroutine
+                # wedge against just our socket, etc).
+                sys.stderr.write(f"\nproducer: send failed ({e}); reconnecting...\n")
+                try: sock.close()
+                except OSError: pass
+                delay = 1.0
+                while not ctl["quit"]:
+                    try:
+                        sock = establish()
+                        sock_holder[0] = sock
+                        sys.stderr.write("producer: reconnected\n")
+                        break
+                    except (OSError, TimeoutError) as rerr:
+                        sys.stderr.write(
+                            f"  reconnect failed ({rerr}); retrying in {delay:.0f}s\n")
+                        time.sleep(delay)
+                        delay = min(delay * 2, args.reconnect_max_delay)
+                if ctl["quit"]:
+                    break
+                continue  # frame was lost; next iteration captures a fresh one
 
             if interactive:
                 diag.set_phase("mirror")
