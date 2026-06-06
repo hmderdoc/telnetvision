@@ -57,8 +57,17 @@ if "%INSECURE%"=="1" set "INSECURE_FLAG=--insecure"
 set "CAPTION_FLAG="
 if defined CAPTION_FILE set CAPTION_FLAG=--caption-file "%CAPTION_FILE%"
 
-set "PY=python"
-where %PY% >NUL 2>&1 || ( echo error: python not on PATH & exit /b 1 )
+rem Prefer the venv's python.exe if one's already set up next to the script —
+rem it has the cv2/numpy/etc. that pip put there. No need to ".venv\Scripts\
+rem activate" first (which, without `call`, would replace this batch and
+rem abort the rest of the script).
+set "VENVPY=%~dp0.venv\Scripts\python.exe"
+if exist "%VENVPY%" (
+  set "PY=%VENVPY%"
+) else (
+  set "PY=python"
+  where %PY% >NUL 2>&1 || ( echo error: python not on PATH ^(or set up the venv: py -m venv .venv ^&^& .venv\Scripts\pip install -r requirements.txt^) & exit /b 1 )
+)
 where ffmpeg >NUL 2>&1 || ( echo error: ffmpeg not on PATH ^(install from https://www.gyan.dev/ffmpeg/builds/^) & exit /b 1 )
 
 echo source : %SOURCE%

@@ -73,6 +73,8 @@ The producer is Python and runs on Windows; the bash launchers (`stream.sh`, etc
 
    The live mirror (the `+/- m g q` keys) is **auto-disabled on Windows** because it relies on Unix TTY APIs — the stream itself works fine without it.
 
+   **Unattended startup (Windows).** Producer auto-reconnects on stalls, retries the initial connect on transient TLS resets, and `stream-source.bat` auto-finds the venv's python — so the simplest way to run it at boot is **Task Scheduler** with action *Start a program* → `C:\path\to\telnetvision\stream-source.bat`, trigger *At log on* (or *At startup* if you'd rather not auto-login). Don't put `.venv\Scripts\activate` in your wrapper batch — without `call` it replaces the parent batch and aborts it; the script doesn't need activation anyway. If you also want captions, add a *second* task running `python caption-source.py` (it has its own retry/restart-friendly loop and writes the same `CAPTION_FILE` the producer is broadcasting).
+
 For live mic captions on Windows you also need **whisper.cpp's `whisper-stream.exe`**. Grab a prebuilt zip from <https://github.com/ggml-org/whisper.cpp/releases> — pick `whisper-blas-bin-Win32.zip` (32-bit) or `whisper-blas-bin-x64.zip` (64-bit). Extract it; the zip ships `whisper-stream.exe`, `SDL2.dll`, and a ggml model is downloaded separately. Grab a model the same way the Mac/Linux side does — `ggml-base.en.bin` from <https://huggingface.co/ggerganov/whisper.cpp> works.
 
 `caption-mic.sh` is bash (run it under Git Bash if you'd rather), but you can wire whisper directly without it — the Python filter is cross-platform:

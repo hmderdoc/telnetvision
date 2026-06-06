@@ -257,24 +257,37 @@ def main():
     elif not use_test:
         cap = open_capture(source, args.camera)
 
+    # Live-adjustable state, shared with the stdin reader thread. Python's GIL
+    # makes single-key writes/reads atomic; we snapshot at the top of each frame.
+    # Defined before connect so 'q' during startup-retry interrupts cleanly.
+    ctl = {"sat": args.saturation, "con": args.contrast, "bri": args.brightness,
+           "mode": args.mode, "ramp": args.ramp, "quit": False}
+    sock_holder = [None]  # the stdin reader uses this to find the current sock
+
     def establish():
-        """Open a fresh socket + send the producer hello. Returns the new
-        socket. Used at startup and whenever auto-reconnect fires."""
+        """Open a fresh socket + send the producer hello. Raises on any
+        failure (connect refused, TLS handshake error, hello write failure).
+        connect_with_backoff() retries this."""
         s = connect(args)
         if args.send_timeout > 0:
             s.settimeout(args.send_timeout)
         wire.hello_producer(s, args.token, args.channel)
         return s
 
-    # sock_holder lets the stdin-reader thread always see the current socket,
-    # so 'q' can shut down a connection that was just replaced by a reconnect.
-    sock = establish()
-    sock_holder = [sock]
-
-    # Live-adjustable state, shared with the stdin reader thread. Python's GIL
-    # makes single-key writes/reads atomic; we snapshot at the top of each frame.
-    ctl = {"sat": args.saturation, "con": args.contrast, "bri": args.brightness,
-           "mode": args.mode, "ramp": args.ramp, "quit": False}
+    def connect_with_backoff(label):
+        """Try establish() until success or ctl["quit"]. Returns the new socket
+        or None if the user quit during retry. Used for both initial startup
+        and mid-stream reconnect."""
+        delay = 1.0
+        while not ctl["quit"]:
+            try:
+                return establish()
+            except (OSError, TimeoutError) as e:
+                sys.stderr.write(
+                    f"producer: {label} failed ({e}); retrying in {delay:.0f}s\n")
+                time.sleep(delay)
+                delay = min(delay * 2, args.reconnect_max_delay)
+        return None
 
     out = sys.stdout
     old_term = None
@@ -308,13 +321,24 @@ def main():
                     elif k == "0":        ctl["sat"], ctl["con"], ctl["bri"] = 1.0, 1.0, 0
                     elif k in ("q", "Q"):
                         ctl["quit"] = True
-                        try:
-                            sock_holder[0].shutdown(socket.SHUT_RDWR)
-                        except OSError:
-                            pass
+                        s = sock_holder[0]
+                        if s is not None:  # may not yet exist during startup retry
+                            try:
+                                s.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
                         return
 
         threading.Thread(target=stdin_reader, daemon=True).start()
+
+    # Initial connect, with the same retry/backoff loop the mid-stream
+    # reconnect uses. So a transient TLS handshake reset (or the cloud box
+    # being down for a few seconds at boot) doesn't crash the producer — it
+    # waits and tries again.
+    sock = connect_with_backoff("connect")
+    if sock is None:
+        sys.exit(0)  # user pressed q during startup retry
+    sock_holder[0] = sock
 
     interval = 1.0 / args.fps
     n = 0
@@ -376,20 +400,11 @@ def main():
                 sys.stderr.write(f"\nproducer: send failed ({e}); reconnecting...\n")
                 try: sock.close()
                 except OSError: pass
-                delay = 1.0
-                while not ctl["quit"]:
-                    try:
-                        sock = establish()
-                        sock_holder[0] = sock
-                        sys.stderr.write("producer: reconnected\n")
-                        break
-                    except (OSError, TimeoutError) as rerr:
-                        sys.stderr.write(
-                            f"  reconnect failed ({rerr}); retrying in {delay:.0f}s\n")
-                        time.sleep(delay)
-                        delay = min(delay * 2, args.reconnect_max_delay)
-                if ctl["quit"]:
-                    break
+                sock = connect_with_backoff("reconnect")
+                if sock is None:
+                    break  # user pressed q while we were retrying
+                sock_holder[0] = sock
+                sys.stderr.write("producer: reconnected\n")
                 continue  # frame was lost; next iteration captures a fresh one
 
             if interactive:
