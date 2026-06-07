@@ -25,14 +25,18 @@ if not exist .env (
 
 rem Parse .env: identifier=value lines only; strip a matching pair of
 rem surrounding double-quotes (so TOKEN="abc" and TOKEN=abc both work);
-rem don't clobber vars already in the environment.
+rem don't clobber vars already in the environment. We use `call set` for the
+rem final assignment so values containing %VAR% references (e.g.
+rem CAPTION_FILE=%temp%\caption.txt) get an extra expansion pass — without
+rem `call`, the for-loop captures the literal string %temp%\caption.txt and
+rem the producer writes to a file literally named "%temp%\caption.txt".
 for /F "usebackq tokens=1* delims==" %%A in (`findstr /R "^[A-Za-z_][A-Za-z0-9_]*=" .env`) do (
   set "KEY=%%A"
   set "VAL=%%B"
   if defined VAL (
     if "!VAL:~0,1!"=="""" if "!VAL:~-1!"=="""" set "VAL=!VAL:~1,-1!"
   )
-  if not defined !KEY! set "!KEY!=!VAL!"
+  if not defined !KEY! call set "!KEY!=!VAL!"
 )
 
 if not "%~1"=="" set "SOURCE=%~1"
