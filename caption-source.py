@@ -131,7 +131,13 @@ def main() -> int:
         f"model={Path(model).name} -> {caption_file}\n")
 
     # ffmpeg: demux source, drop video, mono 16k s16le PCM to stdout.
-    ff_cmd = [ffmpeg, "-nostdin", "-loglevel", "warning", "-i", source,
+    # +discardcorrupt + ignore_err keep ffmpeg going past the AC3/PES errors
+    # that show up routinely in broadcast TS streams (RF noise, packet loss);
+    # without these flags every corrupt packet logs a warning, drowning the
+    # log without changing behaviour.
+    ff_cmd = [ffmpeg, "-nostdin", "-loglevel", "error",
+              "-fflags", "+discardcorrupt", "-err_detect", "ignore_err",
+              "-i", source,
               "-vn", "-map", "0:a:0?", "-ac", "1", "-ar", str(SAMPLE_RATE),
               "-f", "s16le", "-"]
     ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=sys.stderr)

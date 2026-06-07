@@ -75,6 +75,6 @@ echo pixels : %COLS%x%IH%  (pre-downscaled by ffmpeg; Python never touches a ful
 echo target : %BBS_HOST%:%BBS_PORT%  channel=%CHANNEL%  fps=%FPS%
 echo.
 
-ffmpeg -nostdin -loglevel warning -i "%SOURCE%" -an -vf "scale=%COLS%:%IH%,fps=%FPS%" -pix_fmt bgr24 -f rawvideo - | %PY% producer.py --source - --in-size %COLS%x%IH% --host %BBS_HOST% --port %BBS_PORT% --token %TOKEN% --channel %CHANNEL% --cols %COLS% --rows %ROWS% --fps %FPS% --no-flip %TLS_FLAG% %INSECURE_FLAG% %CAPTION_FLAG%
+ffmpeg -nostdin -loglevel error -fflags +discardcorrupt -err_detect ignore_err -i "%SOURCE%" -an -vf "scale=%COLS%:%IH%,fps=%FPS%" -pix_fmt bgr24 -f rawvideo - | %PY% producer.py --source - --in-size %COLS%x%IH% --host %BBS_HOST% --port %BBS_PORT% --token %TOKEN% --channel %CHANNEL% --cols %COLS% --rows %ROWS% --fps %FPS% --no-flip %TLS_FLAG% %INSECURE_FLAG% %CAPTION_FLAG%
 
 endlocal
