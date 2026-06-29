@@ -436,15 +436,17 @@ func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 	return cur
 }
 
-// renderCaption draws caption text as a centered subtitle bar on the bottom row
-// (row `rows`), overlaying the video. Non-ASCII becomes '?' in CP437.
-func renderCaption(buf *bytes.Buffer, caption []byte, dstCols, dstRows int, cp437 bool) {
+// renderCaption draws caption text as a centered subtitle bar of the given
+// width at (col,row) — placed just beneath the letterboxed image (within its
+// column span) rather than the screen's bottom row, so it stays with the
+// content. Non-ASCII becomes '?' in CP437.
+func renderCaption(buf *bytes.Buffer, caption []byte, col, row, width int, cp437 bool) {
 	runes := []rune(string(caption))
-	if len(runes) > dstCols {
-		runes = runes[len(runes)-dstCols:] // keep the most recent words
+	if len(runes) > width {
+		runes = runes[len(runes)-width:] // keep the most recent words
 	}
-	pad := (dstCols - len(runes)) / 2
-	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[0;37;44m", dstRows) // white-on-blue bar, bottom row
+	pad := (width - len(runes)) / 2
+	fmt.Fprintf(buf, "\x1b[%d;%dH\x1b[0;37;44m", row, col+1) // white-on-blue bar
 	used := 0
 	for ; used < pad; used++ {
 		buf.WriteByte(' ')
@@ -463,7 +465,7 @@ func renderCaption(buf *bytes.Buffer, caption []byte, dstCols, dstRows int, cp43
 		}
 		used++
 	}
-	for ; used < dstCols; used++ {
+	for ; used < width; used++ {
 		buf.WriteByte(' ')
 	}
 	buf.WriteString("\x1b[0m")
@@ -978,7 +980,14 @@ func main() {
 						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, glyph)
 					}
 					if len(caption) > 0 {
-						renderCaption(&buf, caption, dstCols, dstRows, cp437enc)
+						// Place the bar on the row just below the image; if the
+						// image is full height (no bottom margin) overlay its last
+						// row, as before. Span the image's columns, not the screen's.
+						capRow := oy + fitRows + 1
+						if capRow > dstRows {
+							capRow = dstRows
+						}
+						renderCaption(&buf, caption, ox, capRow, fitCols, cp437enc)
 					}
 					if !hintCleared {
 						buf.WriteString("\x1b[1;1H\x1b[1;37;44m Press Q, X or ENTER to quit \x1b[0m")
