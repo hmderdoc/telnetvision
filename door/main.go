@@ -802,6 +802,27 @@ func main() {
 		}
 	}()
 
+	// Local-tty live resize: re-read the kernel size on SIGWINCH. This is the
+	// instant, reliable path for a door run on a real terminal (e.g. iTerm2);
+	// telnet callers get no SIGWINCH and rely on the CPR re-probe in the render
+	// loop instead. No-op on Windows.
+	if autoSize {
+		winch := make(chan os.Signal, 1)
+		notifyWinch(winch)
+		go func() {
+			for range winch {
+				if c, r, ok := localTermSize(output); ok {
+					termCols.Store(int32(c))
+					termRows.Store(int32(r))
+					sized.Store(true)
+					if dbg != nil {
+						dbg.Printf("SIGWINCH term size %dx%d", c, r)
+					}
+				}
+			}
+		}()
+	}
+
 	// settle: if the synchronous probe missed (slow link), keep re-sending the
 	// probe and let the now-running reader catch a CPR reply, so the FIRST frame
 	// is already at the real size instead of the 80×25 fallback. out is still

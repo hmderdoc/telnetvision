@@ -29,6 +29,9 @@ func readTimeout(f *os.File, p []byte, d time.Duration) (int, error) { return 0,
 // to the ANSI probe / -termcols/-termrows / the 80x25 default.
 func localTermSize(f *os.File) (cols, rows int, ok bool) { return 0, 0, false }
 
+// notifyWinch is a no-op on Windows: there's no SIGWINCH.
+func notifyWinch(c chan<- os.Signal) {}
+
 // writeNB writes (blocking) to f; never reports a would-block.
 func writeNB(f *os.File, b []byte) (int, error) {
 	return f.Write(b)

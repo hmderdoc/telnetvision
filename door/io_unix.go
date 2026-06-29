@@ -7,10 +7,17 @@ package main
 import (
 	"io"
 	"os"
+	"os/signal"
 	"syscall"
 	"time"
 	"unsafe"
 )
+
+// notifyWinch subscribes c to terminal-resize signals (SIGWINCH). A door on a
+// local tty receives this when the window resizes; re-reading localTermSize then
+// tracks the new size instantly. There's no equivalent over an inherited socket,
+// where the CPR re-probe is the only live-resize path.
+func notifyWinch(c chan<- os.Signal) { signal.Notify(c, syscall.SIGWINCH) }
 
 func setNonblock(f *os.File) { _ = syscall.SetNonblock(int(f.Fd()), true) }
 func setBlock(f *os.File)    { _ = syscall.SetNonblock(int(f.Fd()), false) }
