@@ -39,6 +39,30 @@ func TestParseCPR(t *testing.T) {
 	}
 }
 
+// The startup probe scans a raw buffer (possibly with surrounding noise) for the
+// cursor / window report, unlike the live keyParser path.
+func TestParseReportScanning(t *testing.T) {
+	// CPR embedded in noise: leading keystroke, trailing junk.
+	if c, r, ok := parseCursorReport([]byte("x\x1b[36;120Ry")); !ok || c != 120 || r != 36 {
+		t.Errorf("parseCursorReport = %d,%d,%v, want 120,36,true", c, r, ok)
+	}
+	// Split-then-complete: a partial report shouldn't match until the final byte.
+	if _, _, ok := parseCursorReport([]byte("\x1b[36;120")); ok {
+		t.Error("parseCursorReport matched an incomplete report")
+	}
+	// Out-of-range rejected.
+	if _, _, ok := parseCursorReport([]byte("\x1b[2;5R")); ok {
+		t.Error("parseCursorReport accepted an out-of-range size")
+	}
+	// xterm window report ESC[8;rows;cols;t.
+	if c, r, ok := parseWindowReport([]byte("\x1b[8;40;132t")); !ok || c != 132 || r != 40 {
+		t.Errorf("parseWindowReport = %d,%d,%v, want 132,40,true", c, r, ok)
+	}
+	if _, _, ok := parseWindowReport([]byte("\x1b[36;120R")); ok {
+		t.Error("parseWindowReport matched a cursor report")
+	}
+}
+
 // A CPR reply must NOT be read as a quit even though it starts with ESC, and it
 // must surface the reported size — the central bug this change fixes.
 func TestKeyParser_CPRDoesNotQuit(t *testing.T) {

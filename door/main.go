@@ -539,6 +539,8 @@ func main() {
 	encoding := flag.String("encoding", "cp437", "half-block glyph: cp437 (byte 0xDF) | utf8 (▀)")
 	color := flag.String("color", "truecolor", "color depth: truecolor (24-bit) | 16 (CGA/ANSI)")
 	fit := flag.String("fit", "letterbox", "fit to caller terminal: letterbox (keep aspect, centered) | stretch (fill)")
+	forceCols := flag.Int("termcols", 0, "force caller terminal width (0 = auto-detect via CPR probe)")
+	forceRows := flag.Int("termrows", 0, "force caller terminal height (0 = auto-detect via CPR probe)")
 	sat := flag.Float64("saturation", 1.8, "saturation boost (color=16 only)")
 	dither := flag.Bool("dither", true, "ordered dithering (color=16 only)")
 	fps := flag.Float64("fps", 15.0, "max render frames/sec")
@@ -581,6 +583,16 @@ func main() {
 	}
 	if v, ok := fromINI("fit"); ok {
 		*fit = v
+	}
+	if v, ok := fromINI("termcols"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			*forceCols = n
+		}
+	}
+	if v, ok := fromINI("termrows"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			*forceRows = n
+		}
 	}
 	if v, ok := fromINI("saturation"); ok {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -673,13 +685,45 @@ func main() {
 	var termCols, termRows atomic.Int32
 	termCols.Store(80)
 	termRows.Store(25)
+	// A -termcols/-termrows override pins the size and disables probing — use it
+	// when the terminal won't answer CPR, or to verify resampling independently
+	// of detection. Auto-detect is the default (both zero).
+	autoSize := true
+	if *forceCols >= 20 && *forceRows >= 8 {
+		termCols.Store(int32(*forceCols))
+		termRows.Store(int32(*forceRows))
+		autoSize = false
+	}
 
 	// Hide cursor + DISABLE auto-wrap (DECAWM). With auto-wrap on, writing the
 	// last cell of the bottom row (the caption bar fills it every frame) makes
 	// the terminal scroll up one line — that's the row-count-dependent glitch.
-	// The trailing probe asks the terminal its size right away (out is still
-	// blocking here, before the non-blocking pacer takes over).
-	fmt.Fprint(out, "\x1b[?25l\x1b[?7l"+cprProbe)
+	fmt.Fprint(out, "\x1b[?25l\x1b[?7l")
+
+	// Establish the caller's size synchronously, BEFORE the reader goroutine
+	// exists (or it would swallow the reply): the kernel ioctl for a real local
+	// tty, else an ANSI round-trip over the socket. sized tracks whether we've
+	// got a real answer so the settle retry below and the reader cooperate.
+	var sized atomic.Bool
+	if autoSize {
+		if c, r, ok := localTermSize(output); ok {
+			termCols.Store(int32(c))
+			termRows.Store(int32(r))
+			sized.Store(true)
+			if dbg != nil {
+				dbg.Printf("local term size %dx%d", c, r)
+			}
+		} else if c, r, ok := probeSize(input, out, 600*time.Millisecond); ok {
+			termCols.Store(int32(c))
+			termRows.Store(int32(r))
+			sized.Store(true)
+			if dbg != nil {
+				dbg.Printf("probe term size %dx%d", c, r)
+			}
+		} else if dbg != nil {
+			dbg.Printf("size probe: no reply, using %dx%d default", termCols.Load(), termRows.Load())
+		}
+	}
 	var once sync.Once
 	quit := func(code int) {
 		once.Do(func() {
@@ -742,6 +786,7 @@ func main() {
 			case keyResize:
 				termCols.Store(int32(cols))
 				termRows.Store(int32(rows))
+				sized.Store(true)
 				if dbg != nil {
 					dbg.Printf("CPR terminal size %dx%d", cols, rows)
 				}
@@ -756,6 +801,18 @@ func main() {
 			}
 		}
 	}()
+
+	// settle: if the synchronous probe missed (slow link), keep re-sending the
+	// probe and let the now-running reader catch a CPR reply, so the FIRST frame
+	// is already at the real size instead of the 80×25 fallback. out is still
+	// blocking here, before the non-blocking pacer takes over.
+	if autoSize && !sized.Load() {
+		deadline := time.Now().Add(1200 * time.Millisecond)
+		for time.Now().Before(deadline) && !sized.Load() {
+			fmt.Fprint(out, cprProbe)
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
 
 	var mu sync.Mutex
 	var latest []byte
@@ -893,8 +950,9 @@ func main() {
 					if !hintCleared {
 						buf.WriteString("\x1b[1;1H\x1b[1;37;44m Press Q, X or ENTER to quit \x1b[0m")
 					}
-					// Ride a size re-probe out with this frame (~1/sec).
-					if time.Now().After(nextProbe) {
+					// Ride a size re-probe out with this frame (~1/sec) for live
+					// resize, unless the size is pinned by -termcols/-termrows.
+					if autoSize && time.Now().After(nextProbe) {
 						buf.WriteString(cprProbe)
 						nextProbe = time.Now().Add(time.Second)
 					}
