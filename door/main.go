@@ -748,7 +748,11 @@ func main() {
 		}
 		var kp keyParser
 		var escAt time.Time // when a lone ESC started pending, for its timeout
-		b := make([]byte, 1)
+		// Read in chunks, not one byte at a time: a CPR reply (ESC[rows;colsR)
+		// arrives as one burst, so reading it whole and feeding the parser the
+		// full chunk parses it atomically — no inter-byte poll gaps where a
+		// fragment could stall or trip the lone-ESC timeout.
+		b := make([]byte, 64)
 		for {
 			n, again, err := readInput(input, b)
 			// In stdio mode, stdin usually shares its open-file flags with stdout
@@ -778,20 +782,23 @@ func main() {
 				quit(0)
 			}
 			if dbg != nil {
-				dbg.Printf("input byte: %d", b[0])
+				dbg.Printf("input %d bytes: % x", n, b[:n])
 			}
-			switch ev, cols, rows := kp.feed(b[0]); ev {
-			case keyQuit:
-				quit(0)
-			case keyResize:
-				termCols.Store(int32(cols))
-				termRows.Store(int32(rows))
-				sized.Store(true)
-				if dbg != nil {
-					dbg.Printf("CPR terminal size %dx%d", cols, rows)
+			for i := 0; i < n; i++ {
+				switch ev, cols, rows := kp.feed(b[i]); ev {
+				case keyQuit:
+					quit(0)
+				case keyResize:
+					termCols.Store(int32(cols))
+					termRows.Store(int32(rows))
+					sized.Store(true)
+					if dbg != nil {
+						dbg.Printf("CPR terminal size %dx%d", cols, rows)
+					}
 				}
 			}
-			// Stamp/clear the lone-ESC timer based on whether an ESC is pending.
+			// Stamp/clear the lone-ESC timer based on whether an ESC is pending
+			// after consuming the whole chunk.
 			if kp.awaitingEscape() {
 				if escAt.IsZero() {
 					escAt = time.Now()
@@ -869,11 +876,13 @@ func main() {
 
 	var pending []byte // the single frame currently being flushed (nil = idle)
 	pendingOff := 0
+	pendingIsFrame := false // whether pending is a rendered frame (vs a bare probe)
 	minInterval := time.Duration(float64(time.Second) / *fps)
 	var lastStart time.Time
-	// Re-probe the terminal size about once a second by riding the request on the
-	// next rendered frame (so it's serialized with frame output and never splits a
-	// frame's escape sequences). The startup write already sent the first probe.
+	// Re-probe the terminal size ~1/sec for live resize. The probe goes out only
+	// when idle (pending == nil), so it's serialized with frames and never splits
+	// one mid-flush; it's NOT gated on a fresh frame, so a slow link or a static
+	// stream still tracks resizes.
 	nextProbe := time.Now().Add(time.Second)
 
 	flushed := 0 // frames fully sent since lastReport — the real (measured) fps
@@ -891,10 +900,12 @@ func main() {
 			}
 			if pendingOff >= len(pending) {
 				pending, pendingOff = nil, 0
-				flushed++
-				rendered++
-				if *frames > 0 && rendered >= *frames {
-					break
+				if pendingIsFrame { // a bare size-probe write isn't a frame
+					flushed++
+					rendered++
+					if *frames > 0 && rendered >= *frames {
+						break
+					}
 				}
 			} else if werr != nil {
 				break // caller/pipe gone
@@ -921,6 +932,8 @@ func main() {
 			if e {
 				break
 			}
+			var buf bytes.Buffer
+			builtFrame := false
 			if haveNew && time.Since(lastStart) >= minInterval && len(f) >= 9 {
 				srcCols := int(binary.BigEndian.Uint16(f[1:3]))
 				srcRows := int(binary.BigEndian.Uint16(f[3:5]))
@@ -954,7 +967,6 @@ func main() {
 						prev = nil
 						renderSig = sig
 					}
-					var buf bytes.Buffer
 					if prev == nil {
 						buf.WriteString("\x1b[2J\x1b[H")
 					}
@@ -971,17 +983,23 @@ func main() {
 					if !hintCleared {
 						buf.WriteString("\x1b[1;1H\x1b[1;37;44m Press Q, X or ENTER to quit \x1b[0m")
 					}
-					// Ride a size re-probe out with this frame (~1/sec) for live
-					// resize, unless the size is pinned by -termcols/-termrows.
-					if autoSize && time.Now().After(nextProbe) {
-						buf.WriteString(cprProbe)
-						nextProbe = time.Now().Add(time.Second)
-					}
-					pending = buf.Bytes()
-					pendingOff = 0
 					lastStart = time.Now()
-					didWork = true
+					builtFrame = true
 				}
+			}
+			// Live-resize re-probe on a timer, NOT gated on a rendered frame:
+			// rides the frame buffer if we built one this tick, else goes out as a
+			// standalone write — either way only when idle, so it never splits a
+			// frame. The reply comes back as a CPR the reader turns into a resize.
+			if autoSize && time.Now().After(nextProbe) {
+				buf.WriteString(cprProbe)
+				nextProbe = time.Now().Add(time.Second)
+			}
+			if buf.Len() > 0 {
+				pending = buf.Bytes()
+				pendingOff = 0
+				pendingIsFrame = builtFrame
+				didWork = true
 			}
 		}
 
