@@ -1,2 +1,10 @@
 opencv-python>=4.9
 numpy>=1.26
+# Optional: FLAC encoding for AUDIO_CODEC=flac (halves audio bandwidth).
+# Without it the producer falls back to WAV chunks automatically.
+soundfile>=0.12
+# Audio capture from input devices (mic, capture-card audio) for AUDIO=1.
+# PortAudio is sample-accurate; ffmpeg's avfoundation audio-only capture
+# delivers ~0.4x realtime on macOS (constant chop). URL/file sources don't
+# need this.
+sounddevice>=0.4

@@ -9,6 +9,8 @@ __pycache__/
 # Local build output (CI builds release artifacts; see .github/workflows)
 bin/
 dist/
+door/door
+door/door.exe
 
 # Whisper models — large, downloaded on demand (see models/download.sh)
 models/*.bin

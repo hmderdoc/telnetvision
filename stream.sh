@@ -11,6 +11,10 @@
 #   INSECURE=1  -> TLS on, but skip cert verification (for a self-signed cert)
 #   FLIP=0/1    -> force mirror off/on (default: auto — only --source camera)
 #   CAPTION_FILE=path -> broadcast that file's last line as a subtitle
+#   AUDIO=1     -> also stream audio (SyncTERM >= 1.10a callers hear it)
+#   AUDIO_SOURCE=auto|mic|":<mac device>"|<url/file>  AUDIO_RATE=44100  AUDIO_CHANNELS=2
+#   AUDIO_CODEC=auto|flac|wav         AUDIO_CHUNK_MS=80
+#   AUDIO_OFFSET_MS=0 -> lip-sync trim (positive = audio earlier vs video)
 # Set DRYRUN=1 to print the command instead of running it.
 set -euo pipefail
 
@@ -51,6 +55,15 @@ case "${FLIP:-}" in
   1|true|yes|on)  args+=(--flip) ;;
 esac
 [[ -n "${CAPTION_FILE:-}" ]] && args+=(--caption-file "$CAPTION_FILE")
+if [[ "${AUDIO:-0}" == "1" ]]; then
+  args+=(--audio)
+  [[ -n "${AUDIO_SOURCE:-}" ]]   && args+=(--audio-source "$AUDIO_SOURCE")
+  [[ -n "${AUDIO_RATE:-}" ]]     && args+=(--audio-rate "$AUDIO_RATE")
+  [[ -n "${AUDIO_CHANNELS:-}" ]] && args+=(--audio-channels "$AUDIO_CHANNELS")
+  [[ -n "${AUDIO_CODEC:-}" ]]    && args+=(--audio-codec "$AUDIO_CODEC")
+  [[ -n "${AUDIO_CHUNK_MS:-}" ]] && args+=(--audio-chunk-ms "$AUDIO_CHUNK_MS")
+  [[ -n "${AUDIO_OFFSET_MS:-}" ]] && args+=(--audio-offset-ms "$AUDIO_OFFSET_MS")
+fi
 args+=("$@")
 
 if [[ "${DRYRUN:-0}" == "1" ]]; then

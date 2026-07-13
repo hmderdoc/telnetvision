@@ -3,8 +3,9 @@
 // the latest frame per subscriber (drop-to-latest backpressure).
 //
 // Two listeners:
-//   -ingest    public, token-authenticated (optionally TLS): producers publish
-//   -consumer  local: doors subscribe
+//
+//	-ingest    public, token-authenticated (optionally TLS): producers publish
+//	-consumer  local: doors subscribe
 package main
 
 import (
@@ -23,7 +24,10 @@ const (
 	msgHelloProducer = 0x01
 	msgHelloConsumer = 0x02
 	msgFrame         = 0x10
+	msgAudio         = 0x11
 	maxMsg           = 16 << 20 // RGB frames at terminal resolution are tens of KiB
+
+	capAudio = 0x01 // hello caps bit: producer sends / consumer wants AUDIO
 )
 
 // ---- framing ----------------------------------------------------------------
@@ -63,13 +67,28 @@ func parseString(b []byte, off int) (string, int, bool) {
 // ---- hub --------------------------------------------------------------------
 
 type subscriber struct {
-	mu     sync.Mutex
-	latest []byte
-	notify chan struct{}
+	mu        sync.Mutex
+	latest    []byte   // pending video frame (drop-to-latest: one slot)
+	audio     [][]byte // pending audio chunks (own queue; denser cadence)
+	audioMax  int
+	audioDrop int  // chunks dropped to the audioMax bound (diagnostics)
+	wantAudio bool // consumer hello caps bit: forward AUDIO to this door
+	notify    chan struct{}
 }
 
-func newSubscriber() *subscriber {
-	return &subscriber{notify: make(chan struct{}, 1)}
+func newSubscriber(wantAudio bool, audioMax int) *subscriber {
+	return &subscriber{
+		wantAudio: wantAudio,
+		audioMax:  audioMax,
+		notify:    make(chan struct{}, 1),
+	}
+}
+
+func (s *subscriber) wake() {
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
 }
 
 // set replaces the pending frame, collapsing any unsent one (drop-to-latest).
@@ -77,19 +96,22 @@ func (s *subscriber) set(frame []byte) {
 	s.mu.Lock()
 	s.latest = frame
 	s.mu.Unlock()
-	select {
-	case s.notify <- struct{}{}:
-	default:
-	}
+	s.wake()
 }
 
-func (s *subscriber) take() []byte {
-	<-s.notify
+// pushAudio appends a chunk to the subscriber's audio queue. Audio is a
+// stream, so a full queue drops the OLDEST chunks — same drop-to-latest
+// spirit as video, but with room for a few chunks since audio arrives
+// several times per video frame and gaps are audible.
+func (s *subscriber) pushAudio(framed []byte) {
 	s.mu.Lock()
-	f := s.latest
-	s.latest = nil
+	s.audio = append(s.audio, framed)
+	if len(s.audio) > s.audioMax {
+		s.audioDrop += len(s.audio) - s.audioMax
+		s.audio = append([][]byte(nil), s.audio[len(s.audio)-s.audioMax:]...)
+	}
 	s.mu.Unlock()
-	return f
+	s.wake()
 }
 
 type channel struct {
@@ -123,6 +145,20 @@ func (h *hub) publish(name string, framed []byte) {
 	c.latest = framed
 	for s := range c.subs {
 		s.set(framed)
+	}
+	c.mu.Unlock()
+}
+
+// publishAudio fans an AUDIO message out to the subscribers that asked for
+// audio in their hello. No join-replay (c.latest stays video-only): a stale
+// audio chunk is worthless to a new subscriber.
+func (h *hub) publishAudio(name string, framed []byte) {
+	c := h.get(name)
+	c.mu.Lock()
+	for s := range c.subs {
+		if s.wantAudio {
+			s.pushAudio(framed)
+		}
 	}
 	c.mu.Unlock()
 }
@@ -172,8 +208,24 @@ func (h *hub) clearProducer(name string, conn net.Conn) {
 func (h *hub) handleProducer(conn net.Conn, token string) {
 	defer conn.Close()
 	payload, _, err := readMsg(conn)
-	if err != nil || len(payload) == 0 || payload[0] != msgHelloProducer {
-		log.Printf("producer %s: bad hello", conn.RemoteAddr())
+	if err != nil {
+		// Often this is "EOF" (peer hung up before sending anything) or a TLS
+		// handshake failure; spelling it out distinguishes that from the
+		// "they sent bytes but the wrong ones" case below.
+		log.Printf("producer %s: hello read failed: %v", conn.RemoteAddr(), err)
+		return
+	}
+	if len(payload) == 0 {
+		log.Printf("producer %s: empty hello payload", conn.RemoteAddr())
+		return
+	}
+	if payload[0] != msgHelloProducer {
+		// Almost always means a TLS mismatch (client connected plaintext to a
+		// TLS service, or vice versa) — the first byte of a TLS ClientHello is
+		// 0x16, of a TLS Alert 0x15, etc.
+		log.Printf("producer %s: bad hello opcode 0x%02x (expected 0x%02x); "+
+			"likely TLS mismatch between producer and service",
+			conn.RemoteAddr(), payload[0], msgHelloProducer)
 		return
 	}
 	tok, off, ok := parseString(payload, 1)
@@ -188,7 +240,14 @@ func (h *hub) handleProducer(conn net.Conn, token string) {
 		log.Printf("producer %s: bad token", conn.RemoteAddr())
 		return
 	}
-	log.Printf("producer %s publishing to channel %q", conn.RemoteAddr(), ch)
+	// Wire v2: an optional trailing caps byte advertises what the producer
+	// will send (bit0 = audio). Informational only — routing is per-message.
+	var caps byte
+	if off < len(payload) {
+		caps = payload[off]
+	}
+	log.Printf("producer %s publishing to channel %q (audio=%v)",
+		conn.RemoteAddr(), ch, caps&capAudio != 0)
 	h.setProducer(ch, conn)
 	defer h.clearProducer(ch, conn)
 	for {
@@ -197,27 +256,47 @@ func (h *hub) handleProducer(conn net.Conn, token string) {
 			log.Printf("producer %s gone: %v", conn.RemoteAddr(), err)
 			return
 		}
-		if payload[0] == msgFrame {
+		// The relay stays domain-agnostic: both message classes are opaque
+		// bytes; they differ only in queueing (latest-frame vs audio ring).
+		// Unknown future types are dropped, same as v1 did.
+		switch payload[0] {
+		case msgFrame:
 			h.publish(ch, framed)
+		case msgAudio:
+			h.publishAudio(ch, framed)
 		}
 	}
 }
 
-func (h *hub) handleConsumer(conn net.Conn) {
+func (h *hub) handleConsumer(conn net.Conn, audioQueue int) {
 	defer conn.Close()
 	payload, _, err := readMsg(conn)
 	if err != nil || len(payload) == 0 || payload[0] != msgHelloConsumer {
 		return
 	}
-	ch, _, ok := parseString(payload, 1)
+	ch, off, ok := parseString(payload, 1)
 	if !ok {
 		return
 	}
-	log.Printf("consumer %s subscribed to channel %q", conn.RemoteAddr(), ch)
+	// Wire v2 caps byte: bit0 = this door negotiated audio with its caller.
+	// A v1 door sends no byte and gets video only, exactly as before.
+	var caps byte
+	if off < len(payload) {
+		caps = payload[off]
+	}
+	wantAudio := caps&capAudio != 0
+	log.Printf("consumer %s subscribed to channel %q (audio=%v)", conn.RemoteAddr(), ch, wantAudio)
 
-	s := newSubscriber()
+	s := newSubscriber(wantAudio, audioQueue)
 	h.subscribe(ch, s)
 	defer h.unsubscribe(ch, s)
+	if wantAudio {
+		defer func() {
+			if s.audioDrop > 0 {
+				log.Printf("consumer %s: dropped %d audio chunks to the queue bound", conn.RemoteAddr(), s.audioDrop)
+			}
+		}()
+	}
 
 	// Detect disconnect so we can stop the writer.
 	done := make(chan struct{})
@@ -235,7 +314,16 @@ func (h *hub) handleConsumer(conn net.Conn) {
 		s.mu.Lock()
 		f := s.latest
 		s.latest = nil
+		aud := s.audio
+		s.audio = nil
 		s.mu.Unlock()
+		// Audio first: chunks are latency-critical and in-order; the video
+		// frame is already the freshest by construction.
+		for _, a := range aud {
+			if _, err := conn.Write(a); err != nil {
+				return
+			}
+		}
 		if f == nil {
 			continue
 		}
@@ -263,6 +351,9 @@ func main() {
 	token := flag.String("token", "", "shared token producers must present")
 	certFile := flag.String("tls-cert", "", "TLS cert for the ingest listener")
 	keyFile := flag.String("tls-key", "", "TLS key for the ingest listener")
+	audioQueue := flag.Int("audio-queue", 16,
+		"per-subscriber audio queue depth in chunks (oldest dropped when full); "+
+			"independent of the video latest-frame slot because audio arrives denser")
 	flag.Parse()
 
 	if *token == "" {
@@ -313,6 +404,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("consumer accept: %v", err)
 		}
-		go h.handleConsumer(conn)
+		go h.handleConsumer(conn, *audioQueue)
 	}
 }

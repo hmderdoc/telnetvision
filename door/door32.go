@@ -5,17 +5,18 @@
 // caller's connection directly without any stdio-bridge plumbing.
 //
 // Spec:
-//   1  Comm type  (0=local, 1=serial, 2=telnet socket, 3=other)
-//   2  Comm/socket handle (integer)
-//   3  Baud rate (0 for telnet/local)
-//   4  BBSID
-//   5  User record position
-//   6  Real name
-//   7  Handle/alias
-//   8  Security level
-//   9  Time left (minutes)
-//   10 Emulation (0=ASCII, 1=ANSI, 2=AVATAR, 3=RIP, 4=MaxGraphics)
-//   11 Node number
+//
+//	1  Comm type  (0=local, 1=serial, 2=telnet socket, 3=other)
+//	2  Comm/socket handle (integer)
+//	3  Baud rate (0 for telnet/local)
+//	4  BBSID
+//	5  User record position
+//	6  Real name
+//	7  Handle/alias
+//	8  Security level
+//	9  Time left (minutes)
+//	10 Emulation (0=ASCII, 1=ANSI, 2=AVATAR, 3=RIP, 4=MaxGraphics)
+//	11 Node number
 package main
 
 import (

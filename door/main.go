@@ -2,8 +2,10 @@
 // pixel grid as half-blocks (▀: top pixel = fg, bottom = bg), writing to stdout.
 //
 // Two independent axes:
-//   -encoding  glyph byte: cp437 (0xDF, for SyncTERM) or utf8 (▀, U+2580)
-//   -color     depth: truecolor (24-bit) or 16 (CGA palette + saturation/dither)
+//
+//	-encoding  glyph byte: cp437 (0xDF, for SyncTERM) or utf8 (▀, U+2580)
+//	-color     depth: truecolor (24-bit) or 16 (CGA palette + saturation/dither)
+//
 // e.g. cp437 + truecolor is the right combo for a modern SyncTERM caller.
 // Only changed cells are redrawn each frame (delta encoding).
 package main
@@ -32,7 +34,10 @@ import (
 const (
 	msgHelloConsumer = 0x02
 	msgFrame         = 0x10
+	msgAudio         = 0x11
 	maxMsg           = 16 << 20 // RGB frames are larger than packed cells
+
+	capAudio = 0x01 // consumer-hello caps bit: forward AUDIO messages to us
 )
 
 // cprProbe asks the caller's terminal for its real size: save cursor, park at
@@ -67,9 +72,11 @@ const (
 type keyEvent int
 
 const (
-	keyNone   keyEvent = iota // nothing actionable (yet)
-	keyQuit                   // user asked to quit
-	keyResize                 // a CPR report arrived; cols/rows give the new size
+	keyNone     keyEvent = iota // nothing actionable (yet)
+	keyQuit                     // user asked to quit
+	keyResize                   // a CPR report arrived; cols/rows give the new size
+	keyAudioDSR                 // an audio DSR (ESC[=7;...n) arrived; params hold the pairs
+	keyMute                     // toggle audio mute
 )
 
 // awaitingEscape reports whether a lone ESC is pending — the caller uses this to
@@ -88,6 +95,8 @@ func (k *keyParser) feed(c byte) (ev keyEvent, cols, rows int) {
 			k.state = ksEsc
 		case 'q', 'Q', 'x', 'X', '\r', '\n', 3: // Q / X / ENTER / Ctrl-C
 			return keyQuit, 0, 0
+		case 'm', 'M': // toggle audio mute (no-op when audio is off)
+			return keyMute, 0, 0
 		}
 	case ksEsc:
 		switch c {
@@ -98,7 +107,12 @@ func (k *keyParser) feed(c byte) (ev keyEvent, cols, rows int) {
 			return keyQuit, 0, 0
 		}
 	case ksCSI:
-		if (c >= '0' && c <= '9') || c == ';' {
+		// Private-prefix bytes must be accepted as params or the sequence
+		// splits mid-way and its tail leaks into ground state as fake
+		// keys: '=' prefixes the audio DSR reply (ESC[=7;...n), '<' the
+		// SGR mouse reports some terminals send (ESC[<0;99;25M — whose
+		// trailing M would otherwise toggle mute on every click).
+		if (c >= '0' && c <= '9') || c == ';' || c == '=' || c == '<' || c == '>' || c == '?' {
 			k.params = append(k.params, c)
 		} else { // final byte ends the sequence
 			k.state = ksGround
@@ -106,6 +120,9 @@ func (k *keyParser) feed(c byte) (ev keyEvent, cols, rows int) {
 				if cc, rr, ok := parseCPR(k.params); ok {
 					return keyResize, cc, rr
 				}
+			}
+			if c == 'n' && len(k.params) > 0 && k.params[0] == '=' {
+				return keyAudioDSR, 0, 0 // caller reads k.params via parseDSRPairs
 			}
 		}
 	case ksIAC:
@@ -182,9 +199,14 @@ func readMsg(r io.Reader) ([]byte, error) {
 	return buf, nil
 }
 
-func helloConsumer(conn net.Conn, channel string) error {
+// helloConsumer subscribes to a channel. caps is the wire-v2 trailing byte
+// (capAudio = also send AUDIO messages); a v1 service ignores trailing bytes.
+func helloConsumer(conn net.Conn, channel string, caps byte) error {
 	c := []byte(channel)
 	payload := append([]byte{msgHelloConsumer, byte(len(c))}, c...)
+	if caps != 0 {
+		payload = append(payload, caps)
+	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
 	_, err := conn.Write(append(hdr[:], payload...))
@@ -358,6 +380,39 @@ func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows,
 		}
 	}
 	return cur
+}
+
+// updateRate folds one busy-window sample (bytes the link accepted while it
+// was the constraint) into the drain-rate estimate. First sample seeds it;
+// later ones blend, favoring history for stability against bursty windows.
+func updateRate(est float64, bytes int, d time.Duration) float64 {
+	r := float64(bytes) / d.Seconds()
+	if est == 0 {
+		return r
+	}
+	return 0.7*est + 0.3*r
+}
+
+// splitANSIUnits cuts a rendered frame into ~target-byte units, each cut
+// placed directly before an ESC byte. A well-formed paint is a run of
+// complete escape sequences and complete glyph byte-runs, so a boundary
+// right before an ESC can never split a sequence or a UTF-8 glyph — which
+// makes it safe to interleave audio APCs between the units. Returns the
+// input as a single unit when it's small or has no further ESC to cut at.
+func splitANSIUnits(b []byte, target int) [][]byte {
+	var units [][]byte
+	for len(b) > target {
+		cut := target
+		for cut < len(b) && b[cut] != 0x1B {
+			cut++
+		}
+		if cut >= len(b) {
+			break
+		}
+		units = append(units, b[:cut])
+		b = b[cut:]
+	}
+	return append(units, b)
 }
 
 // rampGlyphs returns the per-glyph byte sequences (dark -> light) for a ramp id,
@@ -667,16 +722,6 @@ func main() {
 	}
 	stretchFit := strings.EqualFold(strings.TrimSpace(*fit), "stretch")
 
-	conn, err := net.Dial("tcp", net.JoinHostPort(*host, strconv.Itoa(*port)))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dial: %v\n", err)
-		os.Exit(1)
-	}
-	if err := helloConsumer(conn, *channel); err != nil {
-		fmt.Fprintf(os.Stderr, "hello: %v\n", err)
-		os.Exit(1)
-	}
-
 	restoreTTY := ttyRaw() // single-key input; no-op if stdin isn't a tty
 	out := output
 
@@ -726,11 +771,67 @@ func main() {
 			dbg.Printf("size probe: no reply, using %dx%d default", termCols.Load(), termRows.Load())
 		}
 	}
+
+	// Audio feature-detect: one probe, synchronous, BEFORE the reader goroutine
+	// (same rule as the size probe — the reader would swallow the DSR reply).
+	// The result is cached for the whole session; a terminal without Audio
+	// APCs (or with audio=off in door.ini) just gets silent video, no errors.
+	audio := newAudioSession(audioConfigFromINI(ini))
+	audio.detect(input, out, 500*time.Millisecond)
+	if dbg != nil {
+		yn := "no"
+		if audio.enabled {
+			yn = "yes"
+		}
+		dbg.Printf("libsndfile: %s (audio=%s channel=%d)", yn, audio.cfg.Mode, audio.cfg.Channel)
+	}
+	audio.start(out) // base volume + first drain-notify arm; no-op if disabled
+
+	// Dial the fanout service only now, so the consumer hello can carry the
+	// audio caps bit and the relay never wastes bandwidth on chunks we'd skip.
+	fail := func(format string, a ...any) {
+		restoreTTY()
+		fmt.Fprint(out, "\x1b[?7h\x1b[0m\x1b[?25h\n")
+		fmt.Fprintf(os.Stderr, format, a...)
+		os.Exit(1)
+	}
+	conn, err := net.Dial("tcp", net.JoinHostPort(*host, strconv.Itoa(*port)))
+	if err != nil {
+		fail("dial: %v\n", err)
+	}
+	var caps byte
+	if audio.enabled {
+		caps = capAudio
+	}
+	if err := helloConsumer(conn, *channel, caps); err != nil {
+		fail("hello: %v\n", err)
+	}
+
+	// The output pacer writes in units; quit() can fire from the input
+	// goroutine while a unit is HALF-flushed. Exiting there splices the
+	// cleanup into the middle of an escape sequence — fragments leak into
+	// whatever the BBS runs next, and an unterminated APC swallows the
+	// audio Flush below as payload (the queued tail then plays on after
+	// the door is gone). outMu freezes the pacer; curTail is the
+	// in-flight remainder quit must finish before anything else.
+	var outMu sync.Mutex
+	var curTail []byte
+
 	var once sync.Once
 	quit := func(code int) {
 		once.Do(func() {
 			restoreTTY()
-			setBlock(out) // restore blocking so cleanup flushes
+			outMu.Lock() // freeze the pacer; held through exit
+			setBlock(out)
+			if len(curTail) > 0 {
+				out.Write(curTail) // complete the split unit
+				curTail = nil
+			}
+			// Close any string the stream might still have open — a lone
+			// ST is inert on every terminal; an open APC would otherwise
+			// eat the Flush below.
+			fmt.Fprint(out, "\x1b\\")
+			audio.stop(out)                               // kill the queued tail NOW, not after it plays
 			fmt.Fprint(out, "\x1b[?7h\x1b[0m\x1b[?25h\n") // re-enable auto-wrap
 		})
 		os.Exit(code)
@@ -797,6 +898,21 @@ func main() {
 					if dbg != nil {
 						dbg.Printf("CPR terminal size %dx%d", cols, rows)
 					}
+				case keyAudioDSR:
+					// Drain one-shots / poll replies re-anchor the audio
+					// ledger; the render loop emits the re-arm on its tick.
+					if pairs, ok := parseDSRPairs(kp.params); ok {
+						audio.onDSR(pairs, time.Now())
+						if dbg != nil {
+							dbg.Printf("audio DSR %v", pairs)
+						}
+					}
+				case keyMute:
+					// The flush that silences playback rides the next tick.
+					muted := audio.toggleMute()
+					if dbg != nil {
+						dbg.Printf("mute toggled: %v", muted)
+					}
 				}
 			}
 			// Stamp/clear the lone-ESC timer based on whether an ESC is pending
@@ -846,8 +962,10 @@ func main() {
 
 	var mu sync.Mutex
 	var latest []byte
+	var audioIn [][]byte // AUDIO messages awaiting emission (bounded, drop-oldest)
+	const audioInMax = 32
 	dirty, eof := false, false
-	go func() { // keep only the latest frame (drop-to-latest)
+	go func() { // keep only the latest frame (drop-to-latest); queue audio
 		for {
 			p, err := readMsg(conn)
 			if err != nil {
@@ -856,10 +974,23 @@ func main() {
 				mu.Unlock()
 				return
 			}
-			if len(p) > 0 && p[0] == msgFrame {
+			if len(p) == 0 {
+				continue
+			}
+			switch p[0] {
+			case msgFrame:
 				mu.Lock()
 				latest = p
 				dirty = true
+				mu.Unlock()
+			case msgAudio:
+				// The ledger in audioSession is the real backpressure; this
+				// bound only protects memory if the render loop stalls.
+				mu.Lock()
+				audioIn = append(audioIn, p)
+				if len(audioIn) > audioInMax {
+					audioIn = audioIn[len(audioIn)-audioInMax:]
+				}
 				mu.Unlock()
 			}
 		}
@@ -873,62 +1004,183 @@ func main() {
 	var prev []byte
 	renderSig := ""
 	rendered := 0
+	var holdSince time.Time // how long the A/V gate has been holding video
 	hintDeadline := time.Now().Add(5 * time.Second)
 	hintCleared := !*hint
 
-	var pending []byte // the single frame currently being flushed (nil = idle)
-	pendingOff := 0
-	pendingIsFrame := false // whether pending is a rendered frame (vs a bare probe)
+	// The output queue is a list of UNITS, each safe to separate from its
+	// neighbors (a whole small write, or a frame segment cut at an escape
+	// boundary). Audio APCs are injected at the FRONT of the queue — i.e. at
+	// the next unit boundary — so a large frame paint in flight can never
+	// hold the caller's audio channel hostage for its full flush time. That
+	// priority inversion (audio waiting out a 10s-of-KB truecolor repaint on
+	// a saturated link) starves the channel and is heard as chop.
+	type outUnit struct {
+		b        []byte
+		frameEnd bool // completes a rendered frame (fps accounting)
+	}
+	var outq []outUnit
+	var cur []byte // unit currently flushing (nil = none)
+	curOff := 0
+	curFrameEnd := false
 	minInterval := time.Duration(float64(time.Second) / *fps)
 	var lastStart time.Time
-	// Re-probe the terminal size ~1/sec for live resize. The probe goes out only
-	// when idle (pending == nil), so it's serialized with frames and never splits
-	// one mid-flush; it's NOT gated on a fresh frame, so a slow link or a static
-	// stream still tracks resizes.
+	// Re-probe the terminal size ~1/sec for live resize. The probe goes out as
+	// its own unit, so it never splits a frame; it's NOT gated on a fresh
+	// frame, so a slow link or a static stream still tracks resizes.
 	nextProbe := time.Now().Add(time.Second)
 
 	flushed := 0 // frames fully sent since lastReport — the real (measured) fps
 	lastReport := time.Now()
 
+	// Link-rate governor. Audio only stays smooth if the OS buffers BETWEEN
+	// the door and the caller (our socket/pipe, Synchronet's socket) stay
+	// empty — once video stuffs them, injected audio sits behind seconds of
+	// queued paint and no user-space reordering can save it. So: whenever
+	// writes block we are link-bound, and the bytes the link accepted over
+	// that busy window measure its drain rate; video is then paced to 85% of
+	// the estimate via a token bucket (audio spends tokens too but is never
+	// gated — the 15% margin is what keeps the downstream buffers drained).
+	// rateEst == 0 means "never been link-bound": no governing, full speed.
+	var rateEst float64
+	tokens := 0.0
+	lastTokens := time.Now()
+	var busyStart time.Time
+	busyBytes := 0
+	lastShort := time.Now()
+	lastFrameBytes := 8192 // refined after each render; sizes the gate
+
 	for {
 		didWork := false
 
-		// 1. Keep flushing the in-flight frame (non-blocking).
-		if pending != nil {
-			n, werr := writeNB(out, pending[pendingOff:])
+		// Refill the video byte budget from the estimated link rate. The
+		// burst cap (~200ms of link) bounds how far a paint can ever get
+		// ahead of the drain.
+		nowTok := time.Now()
+		if rateEst > 0 {
+			tokens += rateEst * 0.85 * nowTok.Sub(lastTokens).Seconds()
+			if maxBurst := rateEst * 0.2; tokens > maxBurst {
+				tokens = maxBurst
+			}
+		}
+		lastTokens = nowTok
+		// A link that stopped blocking us may have gotten faster (or the
+		// governor is over-throttling and never sees pressure): probe upward
+		// until either writes block again or we return to ungoverned.
+		if rateEst > 0 && time.Since(lastShort) > 3*time.Second {
+			rateEst *= 1.5
+			if rateEst > 8e6 {
+				rateEst = 0
+			}
+			lastShort = time.Now()
+		}
+
+		// 0. Audio injection — every iteration, even mid-frame. Chunks and
+		//    ledger maintenance (Update re-arm, state poll, stale-cushion
+		//    flush) jump the queue at the next unit boundary.
+		if audio.enabled {
+			mu.Lock()
+			chunks := audioIn
+			audioIn = nil
+			mu.Unlock()
+			var abuf bytes.Buffer
+			for _, c := range chunks {
+				if m, ok := parseAudioMsg(c); ok {
+					audio.handleChunk(&abuf, m, time.Now())
+				}
+			}
+			audio.tick(&abuf, time.Now())
+			if abuf.Len() > 0 {
+				outq = append([]outUnit{{b: abuf.Bytes()}}, outq...)
+				tokens -= float64(abuf.Len()) // audio spends budget, ungated
+			}
+		}
+
+		// 1. Keep flushing the in-flight unit; pull the next when done.
+		if cur == nil && len(outq) > 0 {
+			cur, curOff, curFrameEnd = outq[0].b, 0, outq[0].frameEnd
+			outq = outq[1:]
+		}
+		if cur != nil {
+			outMu.Lock()
+			n, werr := writeNB(out, cur[curOff:])
 			if n > 0 {
-				pendingOff += n
+				curOff += n
 				didWork = true
 			}
-			if pendingOff >= len(pending) {
-				pending, pendingOff = nil, 0
-				if pendingIsFrame { // a bare size-probe write isn't a frame
+			if curOff < len(cur) {
+				curTail = cur[curOff:] // quit() finishes this if we die here
+			} else {
+				curTail = nil
+			}
+			outMu.Unlock()
+			nowW := time.Now()
+			if curOff < len(cur) {
+				// Short write: the link is the constraint right now. Open (or
+				// extend) a busy window; what it accepts measures drain rate.
+				lastShort = nowW
+				if busyStart.IsZero() {
+					busyStart, busyBytes = nowW, 0
+				}
+				busyBytes += n
+				if d := nowW.Sub(busyStart); d >= 2*time.Second {
+					rateEst = updateRate(rateEst, busyBytes, d)
+					busyStart, busyBytes = nowW, 0
+				}
+			} else {
+				if !busyStart.IsZero() {
+					busyBytes += n
+					if d := nowW.Sub(busyStart); d >= 300*time.Millisecond {
+						rateEst = updateRate(rateEst, busyBytes, d)
+						if dbg != nil {
+							dbg.Printf("link rate est %.0f B/s", rateEst)
+						}
+					}
+					busyStart = time.Time{}
+				}
+				cur, curOff = nil, 0
+				if curFrameEnd { // probes/audio units aren't frames
+					curFrameEnd = false
 					flushed++
 					rendered++
 					if *frames > 0 && rendered >= *frames {
 						break
 					}
 				}
-			} else if werr != nil {
+			}
+			if werr != nil && cur != nil {
 				break // caller/pipe gone
 			}
 		}
 
 		// 2. Periodically record the rate the link actually sustained.
 		if dbg != nil && time.Since(lastReport) >= time.Second {
-			dbg.Printf("effective fps: %d (target %.0f)", flushed, *fps)
+			gov := "ungoverned"
+			if rateEst > 0 {
+				gov = fmt.Sprintf("%.0fKB/s", rateEst/1000)
+			}
+			dbg.Printf("effective fps: %d (target %.0f) link=%s %s",
+				flushed, *fps, gov, audio.stats(time.Now()))
 			flushed = 0
 			lastReport = time.Now()
 		}
 
-		// 3. Idle and a fresh frame is ready (and the fps cap allows)? Render the
-		//    LATEST one, discarding any we skipped while the last frame drained.
-		if pending == nil {
+		// 3. Queue idle and a fresh frame is ready (and the fps cap allows)?
+		//    Render the LATEST one, discarding any we skipped while the last
+		//    frame drained.
+		if cur == nil && len(outq) == 0 {
+			// Governor gate: take a frame only when the budget covers one
+			// (sized by the previous paint). An ungated frame here would
+			// refill the downstream buffers and put audio behind them again.
+			// The frame stays in `latest` meanwhile — drop-to-latest keeps
+			// whatever we eventually paint fresh, exactly like a slow link.
+			videoBudgetOK := rateEst == 0 || tokens >= float64(lastFrameBytes)
 			mu.Lock()
-			e, haveNew := eof, dirty
-			f := latest
-			if haveNew {
-				dirty = false
+			e := eof
+			var f []byte
+			haveNew := false
+			if dirty && videoBudgetOK {
+				f, haveNew, dirty = latest, true, false
 			}
 			mu.Unlock()
 			if e {
@@ -954,7 +1206,41 @@ func main() {
 				dstRows := int(termRows.Load())
 				// Letterbox (or stretch) the source into the terminal grid.
 				fitCols, fitRows, ox, oy := fitRegion(srcCols, srcRows, dstCols, dstRows, stretchFit)
-				if len(px) >= 2*srcRows*srcCols*3 && srcCols > 0 && srcRows > 0 {
+				pixelBytes := 2 * srcRows * srcCols * 3
+				// A/V sync gate: a v2 frame carries its capture pts after the
+				// pixels. Against the audio clock (queued-ledger derived), a
+				// frame > sync_slack_ms behind is dropped (fresher one is
+				// coming), one > sync_slack_ms ahead is held for the next
+				// tick. Audio is never stretched or re-timed to compensate.
+				skipFrame := false
+				if audio.enabled && len(px) >= pixelBytes+8 {
+					framePts := int64(binary.BigEndian.Uint64(px[pixelBytes : pixelBytes+8]))
+					verdict := audio.videoGate(framePts, time.Now())
+					// Bounded hold: whatever the audio clock thinks, video
+					// must never freeze for more than a second. Sync is a
+					// preference; a live picture is the contract.
+					if verdict == gateHold && !holdSince.IsZero() && time.Since(holdSince) > time.Second {
+						verdict = gateRender
+					}
+					switch verdict {
+					case gateDrop:
+						skipFrame = true
+						holdSince = time.Time{}
+					case gateHold:
+						skipFrame = true
+						if holdSince.IsZero() {
+							holdSince = time.Now()
+						}
+						mu.Lock()
+						if !dirty { // don't clobber a newer frame
+							latest, dirty = f, true
+						}
+						mu.Unlock()
+					default:
+						holdSince = time.Time{}
+					}
+				}
+				if !skipFrame && len(px) >= pixelBytes && srcCols > 0 && srcRows > 0 {
 					if !hintCleared && time.Now().After(hintDeadline) {
 						prev = nil
 						hintCleared = true
@@ -990,7 +1276,11 @@ func main() {
 						renderCaption(&buf, caption, ox, capRow, fitCols, cp437enc)
 					}
 					if !hintCleared {
-						buf.WriteString("\x1b[1;1H\x1b[1;37;44m Press Q, X or ENTER to quit \x1b[0m")
+						hintText := " Press Q, X or ENTER to quit "
+						if audio.enabled {
+							hintText = " Q/X/ENTER quit | M mute "
+						}
+						buf.WriteString("\x1b[1;1H\x1b[1;37;44m" + hintText + "\x1b[0m")
 					}
 					lastStart = time.Now()
 					builtFrame = true
@@ -998,16 +1288,27 @@ func main() {
 			}
 			// Live-resize re-probe on a timer, NOT gated on a rendered frame:
 			// rides the frame buffer if we built one this tick, else goes out as a
-			// standalone write — either way only when idle, so it never splits a
-			// frame. The reply comes back as a CPR the reader turns into a resize.
+			// standalone unit — never splitting a frame. The reply comes back as
+			// a CPR the reader turns into a resize.
 			if autoSize && time.Now().After(nextProbe) {
 				buf.WriteString(cprProbe)
 				nextProbe = time.Now().Add(time.Second)
 			}
 			if buf.Len() > 0 {
-				pending = buf.Bytes()
-				pendingOff = 0
-				pendingIsFrame = builtFrame
+				if builtFrame {
+					// Segment the paint so audio can interleave mid-frame.
+					segs := splitANSIUnits(buf.Bytes(), 4096)
+					for i, sg := range segs {
+						outq = append(outq, outUnit{b: sg, frameEnd: i == len(segs)-1})
+					}
+					lastFrameBytes = buf.Len()
+					if lastFrameBytes < 2048 {
+						lastFrameBytes = 2048 // tiny deltas mustn't open the gate wide
+					}
+				} else {
+					outq = append(outq, outUnit{b: buf.Bytes()})
+				}
+				tokens -= float64(buf.Len())
 				didWork = true
 			}
 		}

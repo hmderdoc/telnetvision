@@ -20,6 +20,7 @@ Capture on your machine, push out to a tiny relay in the cloud, and BBS callers 
 - **Sources**: webcam, HDMI capture card, OBS virtual camera, video files, RTSP/HTTP streams, or a raw `ffmpeg` pipe.
 - **Renders**: half-block "pixel art" (`▀`) or brightness ramp; **24-bit truecolor** or - **Live color grading** from the producer (saturation / contrast / brightness), applied before send so every caller sees it.
 - **Live captions**: feed any speech-to-text into a file and the door draws a subtitle bar; includes a whisper.cpp mic setup.
+- **Real audio** (optional): callers on SyncTERM ≥ 1.10a hear the stream's sound via Audio APCs, kept in sync with the picture; older terminals silently get video-only.
 - **One producer → many callers**, each paced independently. **Latency-bounded**: the door drops stale frames instead of letting a slow link build a backlog (delta-encoded, non-blocking output).
 - **Dials out** from home — no inbound ports on your network. Token-authenticated, TLS-capable ingest.
 - **Tune the BBS view live** via `door.ini` — no Synchronet restart.
@@ -27,6 +28,16 @@ Capture on your machine, push out to a tiny relay in the cloud, and BBS callers 
 ## How it works
 
 The producer captures a frame, color-grades it, downscales to the terminal cell grid, and pushes a compact message (RGB pixels + a render directive + an optional caption) to the **service**. The service is a domain-agnostic fanout relay: one publisher per channel, many subscribers, keeping only the latest frame per subscriber (drop-to-latest). Each **door** — launched by Synchronet per caller — turns those pixels into CP437/ANSI half-blocks or a ramp, in the caller's color depth, **delta-encoding** only the cells that changed, and writes via a **non-blocking pacer** that never queues more than it can flush (so latency stays bounded on slow links). The wire format is documented in [`wire.py`](wire.py).
+
+With `AUDIO=1` the producer also demuxes/captures sound, chops it into short FLAC/WAV chunks stamped on the **same clock** as the video frames, and sends them down the same connection. The relay fans audio out on its own per-subscriber queue (a few chunks deep, oldest dropped) next to the latest-frame slot. The door feature-detects the caller's terminal once at session start and, when the caller is a SyncTERM ≥ 1.10a built with libsndfile, streams each chunk as an [Audio APC](https://syncterm.bbsdev.net/cterm.html) Store/Load/Queue triple; a local queue ledger throttles chunks the caller can't absorb, and video frames are dropped/held against the audio clock so the picture follows the sound. Terminals without the feature just get silent video — no errors on either end.
+
+```
+ HOME                                 CLOUD                     CALLERS
+ ffmpeg/webcam ─▶ producer ══ TLS ══▶ service ─▶ door ─▶ ANSI ─▶ SyncTERM
+       │             │    FRAME(pts)     │  per-sub:  │ APC audio  ≥1.10a
+       └─ audio ─────┘    AUDIO(pts)     │  1 frame + │            (older:
+          (same clock)                   │  N chunks  │            video only)
+```
 
 ## Install
 
@@ -124,6 +135,7 @@ CAPTION_FILE=/tmp/caption.txt  # broadcast this file's last line as a subtitle
 # SOURCE=camera                # what to capture (see below)
 # CAPTURE=2                    # which audio input to transcribe — index OR name (see Live captions)
 # FLIP=0                       # mirror off (auto-mirrors only the default webcam)
+# AUDIO=1                      # stream real audio too (see Audio streaming)
 ```
 
 | Key | Example | What it does |
@@ -158,6 +170,36 @@ Set in `door.ini` (re-read per caller, no restart) or pass as `-flags`:
 
 A modern SyncTERM caller usually wants `encoding = cp437`, `color = truecolor`.
 
+### Audio streaming
+
+Callers on **SyncTERM ≥ 1.10a built with libsndfile** can hear the stream: set `AUDIO=1` in `.env` and the door does the rest. The door probes each caller's terminal once at session start (`Q;libsndfile`); anything older silently gets video-only — no retries, no errors. Callers can press **M** to mute/unmute at any time (muting silences immediately and lets the picture free-run; unmuting rejoins the live stream). Audio is never resampled or stretched to chase sync: the door drops or holds *video* frames against the audio clock instead, so a starved link gets a clean gap rather than a time-warp.
+
+Producer `.env` keys:
+
+| Key | Default | What it does |
+|-----|---------|--------------|
+| `AUDIO` | `0` | `1` captures and streams audio alongside video. |
+| `AUDIO_SOURCE` | *auto* | Where the sound comes from: *auto* demuxes a URL/file `SOURCE`'s own track (via ffmpeg) and falls back to the default mic for webcams; `mic` forces the default input device; `":<name substring>"`/`":<index>"` picks a specific input device. Devices are captured with PortAudio (`pip install sounddevice`) because ffmpeg's audio-only device capture runs at ~0.4× realtime on macOS — constant chop. Anything else is an ffmpeg input (URL/file). |
+| `AUDIO_RATE` / `AUDIO_CHANNELS` | `44100` / `2` | Capture format. The terminal mixes at 44.1 kHz stereo, but it resamples whatever you send — `22050` / `1` sounds fine for TV/speech and cuts the wire cost 4× (~59 KB/s as WAV instead of ~235). Start there; go up only if the link has headroom. |
+| `AUDIO_CODEC` | `auto` | Chunk container: `flac` roughly halves bandwidth but needs `pip install soundfile`; `wav` works everywhere; `auto` picks flac when available. |
+| `AUDIO_CHUNK_MS` | `80` | Chunk size, 40–200. Smaller = lower latency, more per-chunk overhead. |
+| `AUDIO_OFFSET_MS` | `0` | Lip-sync trim. Positive shifts audio earlier relative to video — use it if you hear words after seeing the lips move. |
+
+In the producer mirror, `a` toggles a local audio monitor (ffplay; macOS/Linux). It starts muted — monitoring a mic input would feed back.
+
+Door `door.ini` keys (all optional):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `audio` | `auto` | `auto` = feature-detect the caller's terminal; `on` = skip the probe and trust it; `off` = never send audio. On a *Windows-hosted* door `auto` behaves like `off` (the synchronous probe can't read the reply there) — use `on` |
+| `audio_channel` | `2` | terminal audio channel, 2–15 (0/1 are cterm-owned and rejected) |
+| `audio_slot_start` / `audio_slot_count` | `100` / `100` | the rotating patch-slot pool (must fit in 0–255) |
+| `audio_max_queued` | `6` | latency budget, in chunks: when the caller-side queue piles past it (a source clock running faster than the wall), the stale tail is flushed and playback skips to the present — audio latency stays capped instead of the picture pulling ever further ahead |
+| `audio_prebuffer` | `3` | jitter cushion: this many chunks of reserve (as a silent clip) at stream start and after every underrun. Bigger = smoother on jittery links, at ~chunk×N extra latency |
+| `audio_resync_secs` | `60` | blind tail cap: after this long of continuous playback with no proof the channel was ever empty, flush once — sheds terminal-side clock-drift latency the ledger can't see (lameboy's periodic resync). `0` disables |
+| `sync_slack_ms` | `120` | A/V tolerance before a video frame is dropped (behind audio) or held (ahead) |
+| `audio_volume_db` | `-6` | channel base level, set once at session start |
+
 ### The service (cloud side)
 
 `service` is configured by flags (typically baked into the `ExecStart=` line of
@@ -169,6 +211,7 @@ A modern SyncTERM caller usually wants `encoding = cp437`, `color = truecolor`.
 | `-ingest` | `:7600` | where producers connect (open this port to your home IP) |
 | `-consumer` | `127.0.0.1:7601` | where doors subscribe — keep it on localhost |
 | `-tls-cert` / `-tls-key` | — | TLS cert/key for the ingest listener (omit both for plaintext, then set `TLS=0` on the producer) |
+| `-audio-queue` | `16` | per-subscriber audio queue depth, in chunks (oldest dropped when full); independent of the video latest-frame slot |
 
 **The token is one shared secret used on both ends.** Generate it once and put the *same* value in both places:
 
@@ -265,6 +308,10 @@ stream.sh live.sh streamapp.sh caption-mic.sh   launchers
 | No captions at all | mic permission not granted to your terminal (System Settings → Privacy → Microphone) |
 | Screen capture is black | DRM-protected content — can't and won't be captured |
 | Door view lags / builds up | expected on slow links — the pacer sheds frames; check `effective fps` with `debug =` in door.ini |
+| No sound on caller side | (a) SyncTERM below 1.10a or built without libsndfile — feature-detect disables audio automatically; (b) confirm with the door log: `libsndfile: yes/no` printed at session start (set `debug =` in door.ini); (c) `AUDIO=1` not set in `.env` |
+| Audio and picture drift apart | constant offset: trim with `AUDIO_OFFSET_MS`; growing drift on a slow link: lower `AUDIO_RATE` (e.g. 22050) or use `AUDIO_CODEC=flac` to cut bandwidth |
+| Audio is choppy / "bitcrushed" | the channel is starving between chunks. First check the door log (`debug =` in door.ini): `recv=` should read ~12.5/s at 80ms chunks — lower means the audio *source* is underdelivering (device capture needs `pip install sounddevice`; ffmpeg-only device capture runs at ~0.4× realtime on macOS). If `recv` is healthy: `AUDIO_RATE=22050` + `AUDIO_CHANNELS=1`, raise `audio_prebuffer` in door.ini, raise `AUDIO_CHUNK_MS`, lower the door `fps` |
+| Picture slowly pulls ahead of the sound | latency pile-up from clock drift between the source and the caller's audio device. The door caps it automatically (`audio_max_queued` budget + `audio_resync_secs` blind flush — `resyncs=` in the door log counts corrections). If it still creeps, lower `audio_resync_secs` (e.g. 20) or `audio_max_queued` (e.g. 4) |
 
 
 ## Contributing
