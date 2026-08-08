@@ -26,6 +26,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -44,6 +45,24 @@ const (
 	audioFeatureID = 100 // DSR id of the libsndfile feature reply
 
 	featureProbe = "\x1b_SyncTERM:Q;libsndfile\x1b\\"
+
+	// query3DS identifies a 3dBBS caller — the Nintendo 3DS homebrew terminal.
+	// It answers `APC 3DS:Ver;<maj>;<min> ST`; every other terminal ignores an
+	// unknown APC entirely, so a missing reply simply means "not a handheld".
+	//
+	// Worth the extra probe because that client cannot take a desktop stream:
+	// it drains its 256 KB socket ring through exactly ONE 8192-byte parse per
+	// rendered frame (3dBBS source/main.c, `telnetRead(rxbuf, sizeof rxbuf)`),
+	// so its intake ceiling is 8 KB x fps — far below what truecolor video
+	// plus 22050 Hz audio asks for. Its terminal size is 80x25, the same as a
+	// desktop SyncTERM, so nothing else here can tell them apart.
+	query3DS = "\x1b_3DS:Query\x1b\\"
+
+	// Grace after the libsndfile reply to let a 3DS:Ver answer land behind it.
+	// Both probes are APC jobs on the client's FIFO worker so the replies
+	// arrive in order; there is no negative reply to wait on, so this bounded
+	// wait is the whole cost of the extra probe on a desktop terminal.
+	query3DSGrace = 250 * time.Millisecond
 
 	// Wire AUDIO codec ids (must match wire.py).
 	codecRaw  = 0
@@ -171,6 +190,13 @@ type audioSession struct {
 	cfg     audioConfig
 	enabled bool
 
+	// is3DBBS marks a 3dBBS caller (Nintendo 3DS homebrew terminal). It
+	// answers Q;libsndfile truthfully, so without a second probe it is
+	// indistinguishable from a desktop SyncTERM and gets a desktop-sized
+	// stream it cannot physically consume — see the handheld notes on
+	// query3DS. Set by detect(); read by the render loop.
+	is3DBBS bool
+
 	mu   sync.Mutex
 	slot int // next pool index to use (0..SlotCount-1)
 
@@ -276,13 +302,19 @@ func (s *audioSession) detect(in, out *os.File, timeout time.Duration) {
 		s.enabled = true
 		return
 	}
-	if _, err := out.Write([]byte(featureProbe)); err != nil {
+	// Both probes go out together: a 3dBBS caller answers both, a desktop
+	// SyncTERM answers only the first. Pairing them means the handheld check
+	// costs nothing extra when it IS a handheld, and at most query3DSGrace
+	// when it isn't.
+	if _, err := out.Write([]byte(featureProbe + query3DS)); err != nil {
 		s.enabled = false
 		return
 	}
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 0, 128)
 	scratch := make([]byte, 64)
+	gotFeature, feature := false, false
+	var graceEnd time.Time
 	for time.Now().Before(deadline) && len(buf) < 512 {
 		rem := time.Until(deadline)
 		if rem > 50*time.Millisecond {
@@ -291,8 +323,22 @@ func (s *audioSession) detect(in, out *os.File, timeout time.Duration) {
 		n, err := readTimeout(in, scratch, rem)
 		if n > 0 {
 			buf = append(buf, scratch[:n]...)
-			if avail, found := parseFeatureReply(buf, audioFeatureID); found {
-				s.enabled = avail
+			if !gotFeature {
+				if avail, found := parseFeatureReply(buf, audioFeatureID); found {
+					gotFeature, feature = true, avail
+					graceEnd = time.Now().Add(query3DSGrace)
+				}
+			}
+			if parse3DSVer(buf) {
+				// A handheld answered; both replies are in.
+				s.enabled = gotFeature && feature
+				if !gotFeature {
+					// 3dBBS supports libsndfile by contract (PROTOCOL.md s4),
+					// so a version reply that overtook the feature reply is
+					// still proof the sink works.
+					s.enabled = true
+				}
+				s.is3DBBS = true
 				return
 			}
 		} else if err != nil {
@@ -302,8 +348,23 @@ func (s *audioSession) detect(in, out *os.File, timeout time.Duration) {
 			// (the Windows no-op); don't busy-spin until the deadline.
 			time.Sleep(5 * time.Millisecond)
 		}
+		if gotFeature && time.Now().After(graceEnd) {
+			s.enabled = feature // desktop terminal: no 3DS reply is coming
+			return
+		}
+	}
+	if gotFeature {
+		s.enabled = feature
+		return
 	}
 	s.enabled = false // no reply: terminal predates Audio APCs
+}
+
+// parse3DSVer reports whether buf contains a 3dBBS version reply,
+// `ESC _ 3DS:Ver;<maj>;<min> ESC \`. Tolerates surrounding noise: the probe
+// reply can arrive mixed with the CPR answer and typed bytes.
+func parse3DSVer(buf []byte) bool {
+	return bytes.Contains(buf, []byte("\x1b_3DS:Ver;"))
 }
 
 // parseDSRPairs decodes the parameter bytes of an audio DSR — the text
@@ -456,7 +517,18 @@ func (s *audioSession) handleChunk(w io.Writer, m audioMsg, now time.Time) (queu
 
 	file := m.Payload
 	if m.Codec == codecRaw {
-		file = encodeWAV(m.Payload, int(m.SampleRate), int(m.Channels))
+		if s.is3DBBS {
+			// Halve the wire cost for the handheld. 3dBBS decodes WAV
+			// "PCM16/U8" natively (source/audio/apcaudio.c wavDecode) and
+			// answers Q;libsndfileFormat for the U8 subtype with 1, so this
+			// is a real format it asked for — not a downgrade it has to
+			// resample. 8-bit at 22050 Hz is well matched to its speaker,
+			// and unlike lowering the RATE it needs no resampler and cannot
+			// drift the clock: sample count and duration are unchanged.
+			file = encodeWAV8(m.Payload, int(m.SampleRate), int(m.Channels))
+		} else {
+			file = encodeWAV(m.Payload, int(m.SampleRate), int(m.Channels))
+		}
 	}
 	if s.fillingLocked() {
 		s.fill = append(s.fill, heldChunk{file: file, codec: m.Codec, durMs: dur, pts: int64(m.PtsMs)})
@@ -508,7 +580,15 @@ func (s *audioSession) primeSilenceLocked(w io.Writer, now time.Time) error {
 		silMs = 400
 	}
 	n := int(s.lastRate) * int(s.lastChannels) * 2 * int(silMs) / 1000
-	sil := encodeWAV(make([]byte, n), int(s.lastRate), int(s.lastChannels))
+	// Same format as the real chunks: the handheld's 8-bit path costs half
+	// the bytes, and a prime is emitted on every gap so it is not rare.
+	// (Silence is not all-zeroes in 8-bit WAV — encodeWAV8 biases it to 128.)
+	var sil []byte
+	if s.is3DBBS {
+		sil = encodeWAV8(make([]byte, n), int(s.lastRate), int(s.lastChannels))
+	} else {
+		sil = encodeWAV(make([]byte, n), int(s.lastRate), int(s.lastChannels))
+	}
 	if err := s.emitChunkLocked(w, sil, codecWAV); err != nil {
 		return err
 	}
@@ -813,10 +893,28 @@ func extForCodec(codec byte) string {
 // encodeWAV wraps raw interleaved S16LE PCM in a minimal canonical RIFF/WAVE
 // header so the terminal's libsndfile can decode it.
 func encodeWAV(pcm []byte, rate, channels int) []byte {
+	return encodeWAVBits(pcm, rate, channels, 16)
+}
+
+// encodeWAV8 converts interleaved S16LE PCM to unsigned 8-bit and wraps it as
+// an 8-bit RIFF/WAVE — half the bytes on the wire for the same duration and
+// sample rate. WAV's 8-bit sample format is UNSIGNED (centre 128), unlike
+// 16-bit's signed, so each sample is shifted and biased rather than truncated.
+func encodeWAV8(pcm []byte, rate, channels int) []byte {
+	out := make([]byte, len(pcm)/2)
+	for i := range out {
+		// The high byte of a little-endian S16 is the sample scaled to 8 bits,
+		// still signed; flipping its sign bit is exactly the signed->unsigned
+		// bias. Interleaving survives because every frame shrinks 2:1 alike.
+		out[i] = pcm[i*2+1] ^ 0x80
+	}
+	return encodeWAVBits(out, rate, channels, 8)
+}
+
+func encodeWAVBits(pcm []byte, rate, channels, bits int) []byte {
 	if channels < 1 {
 		channels = 1
 	}
-	const bits = 16
 	byteRate := rate * channels * bits / 8
 	blockAlign := channels * bits / 8
 	v := make([]byte, 0, 44+len(pcm))

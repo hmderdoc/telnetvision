@@ -393,6 +393,35 @@ func updateRate(est float64, bytes int, d time.Duration) float64 {
 	return 0.7*est + 0.3*r
 }
 
+// clampTokens bounds the video byte budget. The ceiling is ~200ms of link but
+// never less than one frame: a lower ceiling than the gate's own threshold
+// makes videoBudgetOK unsatisfiable and freezes the picture for the whole
+// session. The floor is the mirror image — audio spends tokens ungated, and
+// without a floor a stream heavier than the link drives the budget so far
+// negative that video stays dead long after the link recovers.
+func clampTokens(tokens, rateEst, frameBytes float64) float64 {
+	if rateEst <= 0 {
+		return tokens
+	}
+	maxBurst := rateEst * 0.2
+	if maxBurst < frameBytes {
+		maxBurst = frameBytes
+	}
+	if tokens > maxBurst {
+		return maxBurst
+	}
+	if tokens < -maxBurst {
+		return -maxBurst
+	}
+	return tokens
+}
+
+// videoBudgetOK reports whether a fresh frame may be taken. rateEst == 0 means
+// the link has never been the constraint, so there is nothing to govern.
+func videoBudgetOK(rateEst, tokens, frameBytes float64) bool {
+	return rateEst == 0 || tokens >= frameBytes
+}
+
 // splitANSIUnits cuts a rendered frame into ~target-byte units, each cut
 // placed directly before an ESC byte. A well-formed paint is a run of
 // complete escape sequences and complete glyph byte-runs, so a boundary
@@ -785,6 +814,22 @@ func main() {
 		}
 		dbg.Printf("libsndfile: %s (audio=%s channel=%d)", yn, audio.cfg.Mode, audio.cfg.Channel)
 	}
+	// 3dBBS handheld profile. Its intake ceiling is 8 KB per rendered frame
+	// (see query3DS), and audio is the part that must not starve — so spend
+	// the budget on sound and cheapen the picture. Truecolor costs a
+	// ~"38;2;r;g;b;48;2;r;g;b" SGR per changed cell; the 16-colour path is a
+	// few bytes, for the largest single saving available without touching the
+	// producer. The fps cap only trims wasted render work: the real pacing is
+	// the link governor, which now actually engages.
+	if audio.is3DBBS {
+		use16 = true
+		if *fps > 10 {
+			*fps = 10
+		}
+		if dbg != nil {
+			dbg.Printf("3dBBS caller: 16-colour, fps<=%.0f, 8-bit audio", *fps)
+		}
+	}
 	audio.start(out) // base volume + first drain-notify arm; no-op if disabled
 
 	// Dial the fanout service only now, so the consumer hello can carry the
@@ -1048,6 +1093,10 @@ func main() {
 	var busyStart time.Time
 	busyBytes := 0
 	lastShort := time.Now()
+	// A busy window closes only after this long with no short write — proof
+	// the link stopped being the constraint rather than one unit happening
+	// to fit. Comfortably longer than the gap between 4 KB unit writes.
+	const busyIdle = 250 * time.Millisecond
 	lastFrameBytes := 8192 // refined after each render; sizes the gate
 
 	for {
@@ -1059,9 +1108,15 @@ func main() {
 		nowTok := time.Now()
 		if rateEst > 0 {
 			tokens += rateEst * 0.85 * nowTok.Sub(lastTokens).Seconds()
-			if maxBurst := rateEst * 0.2; tokens > maxBurst {
-				tokens = maxBurst
-			}
+			// The cap used to be a flat 200ms of link, which silently
+			// deadlocked the gate below whenever a frame cost more than that:
+			// tokens could never reach lastFrameBytes, no frame was ever
+			// taken, and video froze outright for the session (logged as
+			// governed sessions sitting at 0.0 fps — 116x65 did it for 871
+			// straight samples). Admitting at least one frame turns that into
+			// merely painting SLOWLY, at rateEst/lastFrameBytes fps, which is
+			// what a governor is supposed to do.
+			tokens = clampTokens(tokens, rateEst, float64(lastFrameBytes))
 		}
 		lastTokens = nowTok
 		// A link that stopped blocking us may have gotten faster (or the
@@ -1130,13 +1185,33 @@ func main() {
 			} else {
 				if !busyStart.IsZero() {
 					busyBytes += n
-					if d := nowW.Sub(busyStart); d >= 300*time.Millisecond {
+					// Keep the window OPEN across completed writes. Frames are
+					// segmented into 4 KB units so audio can interleave, and a
+					// unit that small usually completes in one call even on a
+					// saturated link — closing the window here tore it down
+					// before it could ever reach the 300ms needed to measure,
+					// so rateEst stayed 0 ("never been link-bound") and video
+					// ran ungoverned. That is the state the door spent 97% of
+					// its logged life in, while audio chopped behind the paint
+					// it was never throttling. Only a genuine lull in short
+					// writes means the link stopped being the constraint.
+					if d := nowW.Sub(busyStart); nowW.Sub(lastShort) >= busyIdle {
+						if d >= 300*time.Millisecond {
+							rateEst = updateRate(rateEst, busyBytes, d)
+							if dbg != nil {
+								dbg.Printf("link rate est %.0f B/s", rateEst)
+							}
+						}
+						busyStart, busyBytes = time.Time{}, 0
+					} else if d >= 2*time.Second {
+						// Long steady window: fold in a measurement and roll
+						// it over, so a link that never lulls still reports.
 						rateEst = updateRate(rateEst, busyBytes, d)
 						if dbg != nil {
 							dbg.Printf("link rate est %.0f B/s", rateEst)
 						}
+						busyStart, busyBytes = nowW, 0
 					}
-					busyStart = time.Time{}
 				}
 				cur, curOff = nil, 0
 				if curFrameEnd { // probes/audio units aren't frames
@@ -1174,12 +1249,12 @@ func main() {
 			// refill the downstream buffers and put audio behind them again.
 			// The frame stays in `latest` meanwhile — drop-to-latest keeps
 			// whatever we eventually paint fresh, exactly like a slow link.
-			videoBudgetOK := rateEst == 0 || tokens >= float64(lastFrameBytes)
+			budgetOK := videoBudgetOK(rateEst, tokens, float64(lastFrameBytes))
 			mu.Lock()
 			e := eof
 			var f []byte
 			haveNew := false
-			if dirty && videoBudgetOK {
+			if dirty && budgetOK {
 				f, haveNew, dirty = latest, true, false
 			}
 			mu.Unlock()
