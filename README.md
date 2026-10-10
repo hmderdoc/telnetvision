@@ -161,14 +161,15 @@ Set in `door.ini` (re-read per caller, no restart) or pass as `-flags`:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `encoding` | cp437 | glyph charset: `cp437` (byte `0xDF`) or `utf8` (`▀`) |
-| `color` | truecolor | `truecolor` (24-bit) or `16` (CGA palette) |
-| `saturation` / `dither` | 1.8 / true | only applied when `color = 16` |
+| `color` | auto | `auto` (ask the terminal: 24-bit for SyncTERM/fTelnet/xterm-family, 16 for silent clients like NetRunner), `truecolor` (force 24-bit) or `16` (force the CGA palette) |
+| `shade` | true | 16-color path: per-cell shade glyphs (░▒▓) and half blocks chosen perceptually (shadeans); `false` = plain dithered half blocks |
+| `saturation` / `dither` | 1.8 / true | 16-color path only (`dither` only with `shade = false`) |
 | `fps` | 15 | max frames/sec (the pacer drops below this on slow links) |
 | `hint` | true | show a brief "Q/ESC to quit" banner on launch |
 | `channel` | cam | which channel to subscribe to |
 | `debug` | — | path to log capture-device list + effective fps |
 
-A modern SyncTERM caller usually wants `encoding = cp437`, `color = truecolor`.
+`color = auto` gives a SyncTERM caller 24-bit and a NetRunner caller 16 colors automatically; set `truecolor` or `16` only to force one for everybody.
 
 ### Audio streaming
 

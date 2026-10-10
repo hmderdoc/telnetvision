@@ -85,10 +85,9 @@ The door re-reads `door.ini` every time a caller launches it, so edits apply to 
 Two **independent** settings (glyph charset vs color depth):
 
 - `encoding` — `cp437` (byte 0xDF, what SyncTERM expects) or `utf8` (`▀`, for UTF-8 terminals)
-- `color` — `truecolor` (24-bit) or `16` (CGA palette)
+- `color` — `auto` (ask the terminal; default), `truecolor` (force 24-bit) or `16` (force the CGA palette); `shade` — `true` (default) renders the 16-color path with perceptual shade glyphs, `false` keeps dithered half blocks
 
-A modern SyncTERM caller usually wants `encoding = cp437` **and** `color = truecolor`.
-For maximum compatibility with old clients, use `color = 16`.
+With `color = auto` a SyncTERM or fTelnet caller gets 24-bit and a NetRunner caller gets 16 colors without any setting. Use `truecolor` or `16` only to force one depth for everybody.
 
 Also `channel`, `saturation`, `dither` (color=16 only), `fps`, and `host`/`port`. Any
 CLI flag overrides the file (handy for a quick test without editing the ini).

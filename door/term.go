@@ -116,3 +116,13 @@ func parseWindowReport(buf []byte) (cols, rows int, ok bool) {
 	}
 	return 0, 0, false
 }
+
+// fileTimedReader adapts the door's timed read to termprobe.TimedReader so
+// the colour probe can share the startup I/O channel. On Windows readTimeout
+// never returns data, so the probe there sees silence and lands on 16 colours,
+// the same as the size probe's no-reply path.
+type fileTimedReader struct{ f *os.File }
+
+func (r fileTimedReader) ReadTimeout(p []byte, d time.Duration) (int, error) {
+	return readTimeout(r.f, p, d)
+}

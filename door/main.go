@@ -4,7 +4,9 @@
 // Two independent axes:
 //
 //	-encoding  glyph byte: cp437 (0xDF, for SyncTERM) or utf8 (▀, U+2580)
-//	-color     depth: truecolor (24-bit) or 16 (CGA palette + saturation/dither)
+//	-color     depth: auto (ask the terminal; default), truecolor (24-bit) or
+//	           16 (CGA palette: shade glyphs + half blocks, or dithered half
+//	           blocks with -shade=false)
 //
 // e.g. cp437 + truecolor is the right combo for a modern SyncTERM caller.
 // Only changed cells are redrawn each frame (delta encoding).
@@ -12,10 +14,13 @@ package main
 
 import (
 	"bufio"
+
 	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"github.com/hmderdoc/shadecell"
+	"github.com/hmderdoc/termprobe"
 	"io"
 	"log"
 	"net"
@@ -382,6 +387,62 @@ func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows,
 	return cur
 }
 
+// shadeQ is the perceptual 16-colour quantizer (github.com/hmderdoc/shadecell):
+// per cell it picks a space, full block, shade glyph or half block with the
+// fg/bg pair whose eye-mixed colour is closest in Oklab, so the 16-colour
+// palette yields a few hundred tones instead of dithered bands. One door
+// serves one caller, so a single instance is fine.
+var shadeQ = shadecell.New()
+
+// renderShade is the 16-colour path with shade glyphs, same resampling and
+// region as renderCGA. Delta token per cell: [glyph, attr] (2B). Saturation
+// applies before quantizing like renderCGA; no ordered dither, the shade
+// glyphs do that job. cp437 selects raw CP437 bytes, otherwise the Unicode
+// block characters.
+func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, cp437 bool) []byte {
+	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
+	cur := make([]byte, dstRows*dstCols*2)
+	lastSGR := ""
+	curRow, curCol := -1, -1
+	for y := 0; y < dstRows; y++ {
+		spTop, spBot := rowMap[2*y], rowMap[2*y+1]
+		for x := 0; x < dstCols; x++ {
+			sx := colMap[x]
+			tp := (spTop*srcCols + sx) * 3
+			bp := (spBot*srcCols + sx) * 3
+			tr, tg, tb := int(px[tp]), int(px[tp+1]), int(px[tp+2])
+			br, bg, bb := int(px[bp]), int(px[bp+1]), int(px[bp+2])
+			if sat != 1.0 {
+				tr, tg, tb = saturate(tr, tg, tb, sat)
+				br, bg, bb = saturate(br, bg, bb, sat)
+			}
+			c := shadeQ.Pair(shadecell.RGB{R: uint8(tr), G: uint8(tg), B: uint8(tb)}, shadecell.RGB{R: uint8(br), G: uint8(bg), B: uint8(bb)})
+			ci := (y*dstCols + x) * 2
+			cur[ci], cur[ci+1] = c.Ch, c.Attr
+			if prev != nil && prev[ci] == c.Ch && prev[ci+1] == c.Attr {
+				continue
+			}
+			if curRow != y || curCol != x {
+				fmt.Fprintf(buf, "\x1b[%d;%dH", y+1+oy, x+1+ox)
+			}
+			if sgr := shadecell.SGR(c.Attr); sgr != lastSGR {
+				buf.WriteString("\x1b[" + sgr + "m")
+				lastSGR = sgr
+			}
+			if cp437 {
+				buf.WriteByte(c.Ch)
+			} else {
+				buf.WriteString(shadecell.UTF8(c.Ch))
+			}
+			curRow, curCol = y, x+1
+			if curCol >= dstCols {
+				curRow, curCol = -1, -1
+			}
+		}
+	}
+	return cur
+}
+
 // updateRate folds one busy-window sample (bytes the link accepted while it
 // was the constraint) into the drain-rate estimate. First sample seeds it;
 // later ones blend, favoring history for stability against bursty windows.
@@ -623,12 +684,13 @@ func main() {
 	port := flag.Int("port", 7601, "service consumer port")
 	channel := flag.String("channel", "cam", "channel to subscribe to")
 	encoding := flag.String("encoding", "cp437", "half-block glyph: cp437 (byte 0xDF) | utf8 (▀)")
-	color := flag.String("color", "truecolor", "color depth: truecolor (24-bit) | 16 (CGA/ANSI)")
+	color := flag.String("color", "auto", "color depth: auto (probe the terminal) | truecolor (24-bit) | 16 (CGA/ANSI)")
 	fit := flag.String("fit", "letterbox", "fit to caller terminal: letterbox (keep aspect, centered) | stretch (fill)")
 	forceCols := flag.Int("termcols", 0, "force caller terminal width (0 = auto-detect via CPR probe)")
 	forceRows := flag.Int("termrows", 0, "force caller terminal height (0 = auto-detect via CPR probe)")
 	sat := flag.Float64("saturation", 1.8, "saturation boost (color=16 only)")
-	dither := flag.Bool("dither", true, "ordered dithering (color=16 only)")
+	dither := flag.Bool("dither", true, "ordered dithering (color=16 with shade=false only)")
+	shade := flag.Bool("shade", true, "16-color: pick shade glyphs (░▒▓) and half blocks per cell perceptually (shadeans); false = plain dithered half blocks")
 	fps := flag.Float64("fps", 15.0, "max render frames/sec")
 	hint := flag.Bool("hint", true, "show a brief 'Q/X/ENTER to quit' hint at startup")
 	frames := flag.Int("frames", 0, "exit after N rendered frames (0=forever)")
@@ -690,6 +752,11 @@ func main() {
 			*dither = b
 		}
 	}
+	if v, ok := fromINI("shade"); ok {
+		if b, valid := iniBool(v); valid {
+			*shade = b
+		}
+	}
 	if v, ok := fromINI("hint"); ok {
 		if b, valid := iniBool(v); valid {
 			*hint = b
@@ -744,10 +811,12 @@ func main() {
 	if cp437enc {
 		glyph = []byte{0xDF} // ▀ in code page 437, for SyncTERM/classic terminals
 	}
-	use16 := false
+	use16, colorAuto := false, false
 	switch strings.ToLower(strings.TrimSpace(*color)) {
 	case "16", "cga", "ansi", "ansi16":
 		use16 = true
+	case "", "auto":
+		colorAuto = true // decided by the terminal probe below, once the tty is raw
 	}
 	stretchFit := strings.EqualFold(strings.TrimSpace(*fit), "stretch")
 
@@ -814,6 +883,23 @@ func main() {
 		}
 		dbg.Printf("libsndfile: %s (audio=%s channel=%d)", yn, audio.cfg.Mode, audio.cfg.Channel)
 	}
+	// Colour depth: color = auto asks the terminal in band (XTVERSION, DECRQSS,
+	// XTSMGRAPHICS, Device Attributes; github.com/hmderdoc/termprobe), still
+	// BEFORE the reader goroutine for the same reason as the probes above.
+	// SyncTERM, fTelnet and the xterm family answer and keep 24-bit; a terminal
+	// that stays silent (NetRunner, the Linux console) is a 16-colour one and
+	// gets the CGA path instead of truecolor mush. Keys typed meanwhile come
+	// back in Leftover and are replayed into the reader below.
+	var probeLeftover []byte
+	if colorAuto {
+		res := termprobe.ColorDepth(out, fileTimedReader{input}, 400*time.Millisecond)
+		use16 = res.Depth != termprobe.DepthTrue
+		probeLeftover = res.Leftover
+		if dbg != nil {
+			dbg.Printf("color probe: %s -> use16=%v", res, use16)
+		}
+	}
+
 	// 3dBBS handheld profile. Its intake ceiling is 8 KB per rendered frame
 	// (see query3DS), and audio is the part that must not starve — so spend
 	// the budget on sound and cheapen the picture. Truecolor costs a
@@ -900,6 +986,38 @@ func main() {
 		// arrives as one burst, so reading it whole and feeding the parser the
 		// full chunk parses it atomically — no inter-byte poll gaps where a
 		// fragment could stall or trip the lone-ESC timeout.
+		feed := func(c byte) {
+			switch ev, cols, rows := kp.feed(c); ev {
+			case keyQuit:
+				quit(0)
+			case keyResize:
+				termCols.Store(int32(cols))
+				termRows.Store(int32(rows))
+				sized.Store(true)
+				if dbg != nil {
+					dbg.Printf("CPR terminal size %dx%d", cols, rows)
+				}
+			case keyAudioDSR:
+				// Drain one-shots / poll replies re-anchor the audio
+				// ledger; the render loop emits the re-arm on its tick.
+				if pairs, ok := parseDSRPairs(kp.params); ok {
+					audio.onDSR(pairs, time.Now())
+					if dbg != nil {
+						dbg.Printf("audio DSR %v", pairs)
+					}
+				}
+			case keyMute:
+				// The flush that silences playback rides the next tick.
+				muted := audio.toggleMute()
+				if dbg != nil {
+					dbg.Printf("mute toggled: %v", muted)
+				}
+			}
+		}
+		// Keys the caller typed while the colour probe was listening.
+		for _, c := range probeLeftover {
+			feed(c)
+		}
 		b := make([]byte, 64)
 		for {
 			n, again, err := readInput(input, b)
@@ -933,32 +1051,7 @@ func main() {
 				dbg.Printf("input %d bytes: % x", n, b[:n])
 			}
 			for i := 0; i < n; i++ {
-				switch ev, cols, rows := kp.feed(b[i]); ev {
-				case keyQuit:
-					quit(0)
-				case keyResize:
-					termCols.Store(int32(cols))
-					termRows.Store(int32(rows))
-					sized.Store(true)
-					if dbg != nil {
-						dbg.Printf("CPR terminal size %dx%d", cols, rows)
-					}
-				case keyAudioDSR:
-					// Drain one-shots / poll replies re-anchor the audio
-					// ledger; the render loop emits the re-arm on its tick.
-					if pairs, ok := parseDSRPairs(kp.params); ok {
-						audio.onDSR(pairs, time.Now())
-						if dbg != nil {
-							dbg.Printf("audio DSR %v", pairs)
-						}
-					}
-				case keyMute:
-					// The flush that silences playback rides the next tick.
-					muted := audio.toggleMute()
-					if dbg != nil {
-						dbg.Printf("mute toggled: %v", muted)
-					}
-				}
+				feed(b[i])
 			}
 			// Stamp/clear the lone-ESC timer based on whether an ESC is pending
 			// after consuming the whole chunk.
@@ -1335,6 +1428,8 @@ func main() {
 					}
 					if mode == 1 {
 						prev = renderRamp(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, use16, *sat, *dither, rampGlyphs(rampID, cp437enc))
+					} else if use16 && *shade {
+						prev = renderShade(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, cp437enc)
 					} else if use16 {
 						prev = renderCGA(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, *dither, glyph)
 					} else {
