@@ -51,7 +51,15 @@ const (
 // `ESC[<rows>;<cols>R`. We use CPR rather than the xterm window report (ESC[18t)
 // because Synchronet's CTerm answers DSR but has no XTWINOPS responder, so 18t
 // is silently dropped on every SyncTERM build.
-const cprProbe = "\x1b7\x1b[999;999H\x1b[6n\x1b8"
+//
+// Save/restore is the ANSI.SYS form (CSI s / CSI u), NOT DECSC/DECRC (ESC 7 /
+// ESC 8): fTelnet's parser knows only a handful of ESC+letter sequences and
+// prints anything else as text, so ESC 7 / ESC 8 drew a "7" at the cursor and
+// an "8" in the bottom-right cell on every probe. That "8" armed fTelnet's
+// pending-wrap, and the next probe's "7" (when no frame had repositioned the
+// cursor in between) scrolled the whole screen up a row. CTerm, fTelnet and
+// xterm all implement CSI s / CSI u.
+const cprProbe = "\x1b[s\x1b[999;999H\x1b[6n\x1b[u"
 
 // keyParser is the input-stream state machine. The same byte stream from the
 // caller carries three interleaved things — quit keys, telnet IAC negotiation,
