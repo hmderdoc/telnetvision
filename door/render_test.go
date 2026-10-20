@@ -36,7 +36,7 @@ func TestRenderResample(t *testing.T) {
 		px := makePx(sc, sr)
 
 		var b1 bytes.Buffer
-		if got := len(renderTrue(&b1, px, sc, sr, dc, dr, 0, 0, nil, glyph, -1, -1)); got != dc*dr*6 {
+		if got := len(renderTrue(&b1, px, sc, sr, dc, dr, 0, 0, nil, glyph, -1, -1, 0)); got != dc*dr*6 {
 			t.Errorf("renderTrue %v->%v delta len = %d, want %d", d.src, d.dst, got, dc*dr*6)
 		}
 		var b2 bytes.Buffer
@@ -83,9 +83,9 @@ func TestRenderDeltaStable(t *testing.T) {
 	px := makePx(80, 25)
 	glyph := []byte{0xDF}
 	var b1 bytes.Buffer
-	prev := renderTrue(&b1, px, 80, 25, 100, 30, 0, 0, nil, glyph, -1, -1)
+	prev := renderTrue(&b1, px, 80, 25, 100, 30, 0, 0, nil, glyph, -1, -1, 0)
 	var b2 bytes.Buffer
-	prev2 := renderTrue(&b2, px, 80, 25, 100, 30, 0, 0, prev, glyph, -1, -1)
+	prev2 := renderTrue(&b2, px, 80, 25, 100, 30, 0, 0, prev, glyph, -1, -1, 0)
 	if !bytes.Equal(prev, prev2) {
 		t.Error("delta buffer changed across identical frames")
 	}
@@ -109,7 +109,9 @@ func TestRenderSkipsCorner(t *testing.T) {
 	}
 	corner := []byte("\x1b[25;80H")
 	for name, run := range map[string]func(b *bytes.Buffer) int{
-		"true": func(b *bytes.Buffer) int { return len(renderTrue(b, px, 96, 54, dc, dr, 0, 0, nil, glyph, sx, sy)) / 6 },
+		"true": func(b *bytes.Buffer) int {
+			return len(renderTrue(b, px, 96, 54, dc, dr, 0, 0, nil, glyph, sx, sy, 0)) / 6
+		},
 		"cga": func(b *bytes.Buffer) int {
 			return len(renderCGA(b, px, 96, 54, dc, dr, 0, 0, nil, 1.8, true, glyph, sx, sy))
 		},
@@ -138,5 +140,78 @@ func TestRenderSkipsCorner(t *testing.T) {
 	_, _, ox, oy := fitRegion(80, 25, 80, 60, false)
 	if sx, sy := skipCell(80, 60, ox, oy); sy < 25 {
 		t.Errorf("skipCell for letterboxed region = %d,%d lies inside it", sx, sy)
+	}
+}
+
+// jitter returns px with every channel nudged by +-amp (deterministic).
+func jitter(px []byte, amp int) []byte {
+	out := make([]byte, len(px))
+	for i, v := range px {
+		d := (i*7)%(2*amp+1) - amp
+		n := int(v) + d
+		if n < 0 {
+			n = 0
+		}
+		if n > 255 {
+			n = 255
+		}
+		out[i] = byte(n)
+	}
+	return out
+}
+
+// The truecolor noise gate: sensor-level flicker inside the threshold must not
+// repaint anything, and the returned buffer must keep the DISPLAYED colors (so
+// the next comparison is still against the screen). Movement past the
+// threshold must still paint.
+func TestRenderNoiseGate(t *testing.T) {
+	px := makePx(80, 25)
+	glyph := []byte{0xDF}
+	var b1 bytes.Buffer
+	prev := renderTrue(&b1, px, 80, 25, 80, 25, 0, 0, nil, glyph, -1, -1, 10)
+	var b2 bytes.Buffer
+	prev2 := renderTrue(&b2, jitter(px, 3), 80, 25, 80, 25, 0, 0, prev, glyph, -1, -1, 10)
+	if bytes.Contains(b2.Bytes(), glyph) {
+		t.Error("+-3 jitter under a threshold of 10 repainted cells")
+	}
+	if !bytes.Equal(prev, prev2) {
+		t.Error("gated cells did not keep their displayed colors")
+	}
+	var b3 bytes.Buffer
+	renderTrue(&b3, jitter(px, 40), 80, 25, 80, 25, 0, 0, prev, glyph, -1, -1, 10)
+	if !bytes.Contains(b3.Bytes(), glyph) {
+		t.Error("+-40 jitter over a threshold of 10 painted nothing")
+	}
+	// thr 0 is the exact delta: any change paints.
+	var b4 bytes.Buffer
+	renderTrue(&b4, jitter(px, 1), 80, 25, 80, 25, 0, 0, prev, glyph, -1, -1, 0)
+	if !bytes.Contains(b4.Bytes(), glyph) {
+		t.Error("exact delta ignored a +-1 change")
+	}
+}
+
+// Partial SGR: when consecutive cells share a fg or bg, only the changed half
+// goes out, and a frame always opens with a full pair.
+func TestTrueSGRPartial(t *testing.T) {
+	var b bytes.Buffer
+	var s trueSGR
+	s.write(&b, []byte{1, 2, 3, 4, 5, 6})
+	if got := b.String(); got != "\x1b[38;2;1;2;3;48;2;4;5;6m" {
+		t.Fatalf("first SGR = %q", got)
+	}
+	b.Reset()
+	s.write(&b, []byte{1, 2, 3, 7, 8, 9}) // same fg, new bg
+	if got := b.String(); got != "\x1b[48;2;7;8;9m" {
+		t.Errorf("bg-only SGR = %q", got)
+	}
+	b.Reset()
+	s.write(&b, []byte{9, 9, 9, 7, 8, 9}) // new fg, same bg
+	if got := b.String(); got != "\x1b[38;2;9;9;9m" {
+		t.Errorf("fg-only SGR = %q", got)
+	}
+	b.Reset()
+	s.write(&b, []byte{9, 9, 9, 7, 8, 9}) // unchanged
+	if b.Len() != 0 {
+		t.Errorf("unchanged SGR emitted %q", b.String())
 	}
 }

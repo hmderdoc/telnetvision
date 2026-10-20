@@ -327,15 +327,70 @@ func fitRegion(srcCols, srcRows, dstCols, dstRows int, stretch bool) (w, h, ox, 
 	return w, h, (dstCols - w) / 2, (dstRows - h) / 2
 }
 
+// trueSGR tracks the fg/bg the terminal currently holds so a cell that shares
+// one of them with the cell before it sends only the half that changed
+// (~17 bytes saved per such cell; the full pair is ~37 of a cell's ~38 bytes).
+type trueSGR struct {
+	fg, bg [3]byte
+	ok     bool
+}
+
+func (s *trueSGR) write(buf *bytes.Buffer, cell []byte) {
+	var fg, bg [3]byte
+	copy(fg[:], cell[:3])
+	copy(bg[:], cell[3:6])
+	sameFg := s.ok && s.fg == fg
+	sameBg := s.ok && s.bg == bg
+	if sameFg && sameBg {
+		return
+	}
+	buf.WriteString("\x1b[")
+	if !sameFg {
+		fmt.Fprintf(buf, "38;2;%d;%d;%d", fg[0], fg[1], fg[2])
+	}
+	if !sameFg && !sameBg {
+		buf.WriteByte(';')
+	}
+	if !sameBg {
+		fmt.Fprintf(buf, "48;2;%d;%d;%d", bg[0], bg[1], bg[2])
+	}
+	buf.WriteByte('m')
+	s.fg, s.bg, s.ok = fg, bg, true
+}
+
+func absDiff(a, b byte) int {
+	if a > b {
+		return int(a - b)
+	}
+	return int(b - a)
+}
+
+// withinThr reports whether a cell's new top/bottom colors are all within thr
+// per channel of what the caller already shows (prev, 6 bytes).
+func withinThr(prev, top, bot []byte, thr int) bool {
+	for i := 0; i < 3; i++ {
+		if absDiff(prev[i], top[i]) > thr || absDiff(prev[3+i], bot[i]) > thr {
+			return false
+		}
+	}
+	return true
+}
+
 // renderTrue emits 24-bit color half-blocks, redrawing only changed cells. It
 // resamples the srcCols×srcRows source frame into a dstCols×dstRows render
 // region placed at terminal offset (ox,oy) — letterbox margins are simply cells
 // we never draw. Returns the new per-cell token buffer (6 bytes/cell, sized to
 // the render region) for the next delta.
-func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev, glyph []byte, skipX, skipY int) []byte {
+//
+// thr is the noise gate: a cell whose colors all moved by at most thr per
+// channel from what the caller already shows is left alone and keeps its
+// displayed value in the returned buffer, so the comparison is always against
+// the screen and the error never exceeds thr. With the exact delta (thr 0) a
+// camera's +-2 sensor flicker made every frame a full repaint of every cell.
+func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev, glyph []byte, skipX, skipY, thr int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	cur := make([]byte, dstRows*dstCols*6)
-	lastSGR := ""
+	var sgr trueSGR
 	curRow, curCol := -1, -1
 	for y := 0; y < dstRows; y++ {
 		spTop, spBot := rowMap[2*y], rowMap[2*y+1]
@@ -344,23 +399,19 @@ func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 			tp := (spTop*srcCols + sx) * 3
 			bp := (spBot*srcCols + sx) * 3
 			ci := (y*dstCols + x) * 6
+			if prev != nil && withinThr(prev[ci:ci+6], px[tp:tp+3], px[bp:bp+3], thr) {
+				copy(cur[ci:ci+6], prev[ci:ci+6]) // keep what the caller shows
+				continue
+			}
 			copy(cur[ci:ci+3], px[tp:tp+3])
 			copy(cur[ci+3:ci+6], px[bp:bp+3])
 			if x == skipX && y == skipY {
 				continue // the terminal's bottom-right cell: see skipCell
 			}
-			if prev != nil && bytes.Equal(prev[ci:ci+6], cur[ci:ci+6]) {
-				continue
-			}
 			if curRow != y || curCol != x {
 				fmt.Fprintf(buf, "\x1b[%d;%dH", y+1+oy, x+1+ox)
 			}
-			sgr := fmt.Sprintf("38;2;%d;%d;%d;48;2;%d;%d;%d",
-				cur[ci], cur[ci+1], cur[ci+2], cur[ci+3], cur[ci+4], cur[ci+5])
-			if sgr != lastSGR {
-				buf.WriteString("\x1b[" + sgr + "m")
-				lastSGR = sgr
-			}
+			sgr.write(buf, cur[ci:ci+6])
 			buf.Write(glyph)
 			curRow, curCol = y, x+1
 			if curCol >= dstCols {
@@ -723,6 +774,7 @@ func main() {
 	dither := flag.Bool("dither", true, "ordered dithering (color=16 with shade=false only)")
 	shade := flag.Bool("shade", true, "16-color: pick shade glyphs (░▒▓) and half blocks per cell perceptually (shadeans); false = plain dithered half blocks")
 	fps := flag.Float64("fps", 15.0, "max render frames/sec")
+	delta := flag.Int("delta", 10, "truecolor noise gate: leave a cell alone while its colors move <= this much per channel (0 = exact delta)")
 	hint := flag.Bool("hint", true, "show a brief 'Q/X/ENTER to quit' hint at startup")
 	frames := flag.Int("frames", 0, "exit after N rendered frames (0=forever)")
 	iniPath := flag.String("ini", defaultINIPath(), "optional .ini config (read at launch)")
@@ -786,6 +838,11 @@ func main() {
 	if v, ok := fromINI("shade"); ok {
 		if b, valid := iniBool(v); valid {
 			*shade = b
+		}
+	}
+	if v, ok := fromINI("delta"); ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			*delta = n
 		}
 	}
 	if v, ok := fromINI("hint"); ok {
@@ -1467,7 +1524,7 @@ func main() {
 					} else if use16 {
 						prev = renderCGA(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, *dither, glyph, skipX, skipY)
 					} else {
-						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, glyph, skipX, skipY)
+						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, glyph, skipX, skipY, *delta)
 					}
 					if len(caption) > 0 {
 						// Place the bar on the row just below the image; if the
