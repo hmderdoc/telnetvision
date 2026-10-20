@@ -36,19 +36,19 @@ func TestRenderResample(t *testing.T) {
 		px := makePx(sc, sr)
 
 		var b1 bytes.Buffer
-		if got := len(renderTrue(&b1, px, sc, sr, dc, dr, 0, 0, nil, glyph)); got != dc*dr*6 {
+		if got := len(renderTrue(&b1, px, sc, sr, dc, dr, 0, 0, nil, glyph, -1, -1)); got != dc*dr*6 {
 			t.Errorf("renderTrue %v->%v delta len = %d, want %d", d.src, d.dst, got, dc*dr*6)
 		}
 		var b2 bytes.Buffer
-		if got := len(renderCGA(&b2, px, sc, sr, dc, dr, 0, 0, nil, 1.8, true, glyph)); got != dc*dr {
+		if got := len(renderCGA(&b2, px, sc, sr, dc, dr, 0, 0, nil, 1.8, true, glyph, -1, -1)); got != dc*dr {
 			t.Errorf("renderCGA %v->%v delta len = %d, want %d", d.src, d.dst, got, dc*dr)
 		}
 		var b3 bytes.Buffer
-		if got := len(renderRamp(&b3, px, sc, sr, dc, dr, 0, 0, nil, false, 1.8, true, ramp)); got != dc*dr*4 {
+		if got := len(renderRamp(&b3, px, sc, sr, dc, dr, 0, 0, nil, false, 1.8, true, ramp, -1, -1)); got != dc*dr*4 {
 			t.Errorf("renderRamp(true) %v->%v delta len = %d, want %d", d.src, d.dst, got, dc*dr*4)
 		}
 		var b4 bytes.Buffer
-		if got := len(renderRamp(&b4, px, sc, sr, dc, dr, 0, 0, nil, true, 1.8, true, ramp)); got != dc*dr*2 {
+		if got := len(renderRamp(&b4, px, sc, sr, dc, dr, 0, 0, nil, true, 1.8, true, ramp, -1, -1)); got != dc*dr*2 {
 			t.Errorf("renderRamp(16) %v->%v delta len = %d, want %d", d.src, d.dst, got, dc*dr*2)
 		}
 	}
@@ -83,13 +83,60 @@ func TestRenderDeltaStable(t *testing.T) {
 	px := makePx(80, 25)
 	glyph := []byte{0xDF}
 	var b1 bytes.Buffer
-	prev := renderTrue(&b1, px, 80, 25, 100, 30, 0, 0, nil, glyph)
+	prev := renderTrue(&b1, px, 80, 25, 100, 30, 0, 0, nil, glyph, -1, -1)
 	var b2 bytes.Buffer
-	prev2 := renderTrue(&b2, px, 80, 25, 100, 30, 0, 0, prev, glyph)
+	prev2 := renderTrue(&b2, px, 80, 25, 100, 30, 0, 0, prev, glyph, -1, -1)
 	if !bytes.Equal(prev, prev2) {
 		t.Error("delta buffer changed across identical frames")
 	}
 	if bytes.Contains(b2.Bytes(), glyph) {
 		t.Error("second render redrew cells despite no change")
+	}
+}
+
+// The terminal's bottom-right cell must never be written: on terminals that
+// ignore DECAWM off (CTerm) it scrolls the screen. With the region filling the
+// terminal, skipCell names that corner and every renderer must leave it alone
+// while still returning a full-size delta buffer.
+func TestRenderSkipsCorner(t *testing.T) {
+	const dc, dr = 80, 25
+	px := makePx(96, 54)
+	glyph := []byte{0xDF}
+	ramp := rampGlyphs(0, true)
+	sx, sy := skipCell(dc, dr, 0, 0)
+	if sx != dc-1 || sy != dr-1 {
+		t.Fatalf("skipCell = %d,%d, want %d,%d", sx, sy, dc-1, dr-1)
+	}
+	corner := []byte("\x1b[25;80H")
+	for name, run := range map[string]func(b *bytes.Buffer) int{
+		"true": func(b *bytes.Buffer) int { return len(renderTrue(b, px, 96, 54, dc, dr, 0, 0, nil, glyph, sx, sy)) / 6 },
+		"cga": func(b *bytes.Buffer) int {
+			return len(renderCGA(b, px, 96, 54, dc, dr, 0, 0, nil, 1.8, true, glyph, sx, sy))
+		},
+		"shade": func(b *bytes.Buffer) int {
+			return len(renderShade(b, px, 96, 54, dc, dr, 0, 0, nil, 1.8, true, sx, sy)) / 2
+		},
+		"ramp": func(b *bytes.Buffer) int {
+			return len(renderRamp(b, px, 96, 54, dc, dr, 0, 0, nil, true, 1.8, true, ramp, sx, sy)) / 2
+		},
+	} {
+		var b bytes.Buffer
+		if cells := run(&b); cells != dc*dr {
+			t.Errorf("%s: delta cells = %d, want %d", name, cells, dc*dr)
+		}
+		if bytes.Contains(b.Bytes(), corner) {
+			t.Errorf("%s: positioned the cursor on the bottom-right cell", name)
+		}
+		// Row 25 must still be drawn through column 79: the move to 25;79 or
+		// a run that starts earlier on the row and reaches it.
+		if !bytes.Contains(b.Bytes(), []byte("\x1b[25;")) {
+			t.Errorf("%s: bottom row not drawn at all", name)
+		}
+	}
+	// With the corner outside the region (letterboxed, bottom margin), nothing
+	// is skipped: skipCell lands past the region and never matches.
+	_, _, ox, oy := fitRegion(80, 25, 80, 60, false)
+	if sx, sy := skipCell(80, 60, ox, oy); sy < 25 {
+		t.Errorf("skipCell for letterboxed region = %d,%d lies inside it", sx, sy)
 	}
 }

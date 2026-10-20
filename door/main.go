@@ -284,6 +284,17 @@ func sampleMaps(srcCols, srcRows, dstCols, dstRows int) (colMap, rowMap []int) {
 	return colMap, rowMap
 }
 
+// skipCell returns, in render-region coordinates, the one cell the renderers
+// must never write: the terminal's bottom-right corner. Writing that cell on a
+// terminal with auto-wrap on scrolls the whole screen up a row (CTerm/SyncTERM
+// does this immediately, and does not implement DECAWM off, so ESC[?7l is no
+// protection there). If the corner lies outside the region the result is
+// simply never matched. The cell is left blank; one dark corner beats a
+// scrolled frame.
+func skipCell(termCols, termRows, ox, oy int) (x, y int) {
+	return termCols - 1 - ox, termRows - 1 - oy
+}
+
 // fitRegion places the source frame inside the dstCols×dstRows terminal grid.
 // stretch fills the whole terminal (simplest, may distort); letterbox preserves
 // the source's cols:rows ratio, centering it and leaving the margins blank. It
@@ -313,7 +324,7 @@ func fitRegion(srcCols, srcRows, dstCols, dstRows int, stretch bool) (w, h, ox, 
 // region placed at terminal offset (ox,oy) — letterbox margins are simply cells
 // we never draw. Returns the new per-cell token buffer (6 bytes/cell, sized to
 // the render region) for the next delta.
-func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev, glyph []byte) []byte {
+func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev, glyph []byte, skipX, skipY int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	cur := make([]byte, dstRows*dstCols*6)
 	lastSGR := ""
@@ -327,6 +338,9 @@ func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 			ci := (y*dstCols + x) * 6
 			copy(cur[ci:ci+3], px[tp:tp+3])
 			copy(cur[ci+3:ci+6], px[bp:bp+3])
+			if x == skipX && y == skipY {
+				continue // the terminal's bottom-right cell: see skipCell
+			}
 			if prev != nil && bytes.Equal(prev[ci:ci+6], cur[ci:ci+6]) {
 				continue
 			}
@@ -351,7 +365,7 @@ func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 
 // renderCGA emits CP437 + 16-color half-blocks (the BBS path), resampling the
 // source frame into a dstCols×dstRows region at terminal offset (ox,oy). 1 byte/cell.
-func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, dither bool, glyph []byte) []byte {
+func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, dither bool, glyph []byte, skipX, skipY int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	cur := make([]byte, dstRows*dstCols)
 	lastSGR := ""
@@ -367,6 +381,9 @@ func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows,
 			v := byte(top<<4 | bot)
 			ci := y*dstCols + x
 			cur[ci] = v
+			if x == skipX && y == skipY {
+				continue // the terminal's bottom-right cell: see skipCell
+			}
 			if prev != nil && prev[ci] == v {
 				continue
 			}
@@ -399,7 +416,7 @@ var shadeQ = shadecell.New()
 // applies before quantizing like renderCGA; no ordered dither, the shade
 // glyphs do that job. cp437 selects raw CP437 bytes, otherwise the Unicode
 // block characters.
-func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, cp437 bool) []byte {
+func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, cp437 bool, skipX, skipY int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	cur := make([]byte, dstRows*dstCols*2)
 	lastSGR := ""
@@ -419,6 +436,9 @@ func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRow
 			c := shadeQ.Pair(shadecell.RGB{R: uint8(tr), G: uint8(tg), B: uint8(tb)}, shadecell.RGB{R: uint8(br), G: uint8(bg), B: uint8(bb)})
 			ci := (y*dstCols + x) * 2
 			cur[ci], cur[ci+1] = c.Ch, c.Attr
+			if x == skipX && y == skipY {
+				continue // the terminal's bottom-right cell: see skipCell
+			}
 			if prev != nil && prev[ci] == c.Ch && prev[ci+1] == c.Attr {
 				continue
 			}
@@ -525,7 +545,7 @@ func rampGlyphs(rampID int, cp437 bool) [][]byte {
 // renderRamp maps each cell's brightness to a ramp glyph, colored by the cell's
 // average color. Delta token per cell: truecolor [r,g,b,glyphIdx] (4B), 16-color
 // [cgaIdx,glyphIdx] (2B). Glyph is foreground only (background stays default).
-func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, use16 bool, sat float64, dither bool, glyphs [][]byte) []byte {
+func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, use16 bool, sat float64, dither bool, glyphs [][]byte, skipX, skipY int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	ng := len(glyphs)
 	stride := 4
@@ -558,6 +578,9 @@ func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 			} else {
 				cur[ci], cur[ci+1], cur[ci+2], cur[ci+3] = byte(r), byte(g), byte(b), byte(gi)
 				sgr = fmt.Sprintf("38;2;%d;%d;%d", r, g, b)
+			}
+			if x == skipX && y == skipY {
+				continue // the terminal's bottom-right cell: see skipCell
 			}
 			if prev != nil && bytes.Equal(prev[ci:ci+stride], cur[ci:ci+stride]) {
 				continue
@@ -841,8 +864,10 @@ func main() {
 	}
 
 	// Hide cursor + DISABLE auto-wrap (DECAWM). With auto-wrap on, writing the
-	// last cell of the bottom row (the caption bar fills it every frame) makes
-	// the terminal scroll up one line — that's the row-count-dependent glitch.
+	// last cell of the bottom row makes the terminal scroll up one line. Not
+	// every terminal honors ?7l (CTerm/SyncTERM ignores it), so this is only
+	// belt: the braces are skipCell, which keeps the renderers and the caption
+	// bar out of the bottom-right cell altogether.
 	fmt.Fprint(out, "\x1b[?25l\x1b[?7l")
 
 	// Establish the caller's size synchronously, BEFORE the reader goroutine
@@ -1426,14 +1451,15 @@ func main() {
 					if prev == nil {
 						buf.WriteString("\x1b[2J\x1b[H")
 					}
+					skipX, skipY := skipCell(dstCols, dstRows, ox, oy)
 					if mode == 1 {
-						prev = renderRamp(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, use16, *sat, *dither, rampGlyphs(rampID, cp437enc))
+						prev = renderRamp(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, use16, *sat, *dither, rampGlyphs(rampID, cp437enc), skipX, skipY)
 					} else if use16 && *shade {
-						prev = renderShade(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, cp437enc)
+						prev = renderShade(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, cp437enc, skipX, skipY)
 					} else if use16 {
-						prev = renderCGA(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, *dither, glyph)
+						prev = renderCGA(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, *dither, glyph, skipX, skipY)
 					} else {
-						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, glyph)
+						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, glyph, skipX, skipY)
 					}
 					if len(caption) > 0 {
 						// Place the bar on the row just below the image; if the
@@ -1443,7 +1469,16 @@ func main() {
 						if capRow > dstRows {
 							capRow = dstRows
 						}
-						renderCaption(&buf, caption, ox, capRow, fitCols, cp437enc)
+						// On the bottom row the bar must stop one cell short of
+						// the right edge: the bottom-right cell scrolls the
+						// screen (see skipCell).
+						capWidth := fitCols
+						if capRow == dstRows && ox+capWidth >= dstCols {
+							capWidth = dstCols - 1 - ox
+						}
+						if capWidth > 0 {
+							renderCaption(&buf, caption, ox, capRow, capWidth, cp437enc)
+						}
 					}
 					if !hintCleared {
 						hintText := " Press Q, X or ENTER to quit "
