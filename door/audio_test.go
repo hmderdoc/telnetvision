@@ -849,7 +849,7 @@ func TestConfigClampsAndINIOverlay(t *testing.T) {
 	}
 	cfg := audioConfigFromINI(ini)
 	want := audioConfig{Mode: "on", Channel: 5, SlotStart: 10, SlotCount: 20,
-		MaxQueued: 3, Prebuffer: 2, SlackMs: 200, VolumeDB: -12, ResyncSecs: 30}
+		MaxQueued: 3, Prebuffer: 2, SlackMs: 200, VolumeDB: -12, ResyncSecs: 30, Codec: "adpcm"}
 	if cfg != want {
 		t.Fatalf("cfg = %+v, want %+v", cfg, want)
 	}

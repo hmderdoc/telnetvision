@@ -81,10 +81,10 @@ func TestUngovernedLinkIsNotGated(t *testing.T) {
 func TestDetect3DBBSHandheld(t *testing.T) {
 	ft := newFakeTerm(t)
 	go func() {
-		buf := make([]byte, len(featureProbe)+len(query3DS))
+		buf := make([]byte, len(featureProbe)+len(formatProbe)+len(query3DS))
 		io.ReadFull(ft.termOut, buf)
-		if string(buf) != featureProbe+query3DS {
-			t.Errorf("probes = %q, want %q", buf, featureProbe+query3DS)
+		if string(buf) != featureProbe+formatProbe+query3DS {
+			t.Errorf("probes = %q, want %q", buf, featureProbe+formatProbe+query3DS)
 		}
 		// A 3dBBS client answers both, feature reply first (FIFO worker).
 		ft.termIn.WriteString("\x1b[=7;100;1n\x1b_3DS:Ver;0;3\x1b\\")

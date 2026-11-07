@@ -70,6 +70,7 @@ const cprProbe = "\x1b[s\x1b[999;999H\x1b[6n\x1b[u"
 type keyParser struct {
 	state  int
 	params []byte
+	key    byte // the byte behind the last keyPress (0 = a cursor key)
 }
 
 const (
@@ -90,12 +91,17 @@ const (
 	keyResize                   // a CPR report arrived; cols/rows give the new size
 	keyAudioDSR                 // an audio DSR (ESC[=7;...n) arrived; params hold the pairs
 	keyMute                     // toggle audio mute
+	keyEscape                   // a lone ESC (or ESC + a non-sequence byte)
+	keyPress                    // any other key; k.key holds it (see uiKey)
 )
 
 // awaitingEscape reports whether a lone ESC is pending — the caller uses this to
 // apply the short timeout that distinguishes "user pressed Escape" from "the
 // front of a control-sequence burst".
 func (k *keyParser) awaitingEscape() bool { return k.state == ksEsc }
+
+// escapeTimedOut resolves a pending lone ESC as an Escape press.
+func (k *keyParser) escapeTimedOut() { k.state = ksGround }
 
 // feed advances the parser by one byte. On keyResize, cols/rows hold the size.
 func (k *keyParser) feed(c byte) (ev keyEvent, cols, rows int) {
@@ -106,18 +112,22 @@ func (k *keyParser) feed(c byte) (ev keyEvent, cols, rows int) {
 			k.state = ksIAC
 		case 27: // ESC — could begin a control sequence; disambiguate on next byte
 			k.state = ksEsc
-		case 'q', 'Q', 'x', 'X', '\r', '\n', 3: // Q / X / ENTER / Ctrl-C
+		case 'q', 'Q', 'x', 'X', 3: // Q / X / Ctrl-C
 			return keyQuit, 0, 0
 		case 'm', 'M': // toggle audio mute (no-op when audio is off)
 			return keyMute, 0, 0
+		case '\n', 0: // the LF / NUL telnet sends after a CR: not a key of its own
+		default: // everything else is the dialog's business (uiKey)
+			k.key = c
+			return keyPress, 0, 0
 		}
 	case ksEsc:
 		switch c {
 		case '[', 'O': // CSI / SS3 — a control sequence, not a quit
 			k.state, k.params = ksCSI, k.params[:0]
-		default: // ESC + some other byte: treat the ESC as a quit press
+		default: // ESC + some other byte: treat it as an Escape press
 			k.state = ksGround
-			return keyQuit, 0, 0
+			return keyEscape, 0, 0
 		}
 	case ksCSI:
 		// Private-prefix bytes must be accepted as params or the sequence
@@ -136,6 +146,10 @@ func (k *keyParser) feed(c byte) (ev keyEvent, cols, rows int) {
 			}
 			if c == 'n' && len(k.params) > 0 && k.params[0] == '=' {
 				return keyAudioDSR, 0, 0 // caller reads k.params via parseDSRPairs
+			}
+			if c >= 'A' && c <= 'D' && len(k.params) == 0 { // a cursor key
+				k.key = 0
+				return keyPress, 0, 0
 			}
 		}
 	case ksIAC:
@@ -292,17 +306,6 @@ func sampleMaps(srcCols, srcRows, dstCols, dstRows int) (colMap, rowMap []int) {
 	return colMap, rowMap
 }
 
-// skipCell returns, in render-region coordinates, the one cell the renderers
-// must never write: the terminal's bottom-right corner. Writing that cell on a
-// terminal with auto-wrap on scrolls the whole screen up a row (CTerm/SyncTERM
-// does this immediately, and does not implement DECAWM off, so ESC[?7l is no
-// protection there). If the corner lies outside the region the result is
-// simply never matched. The cell is left blank; one dark corner beats a
-// scrolled frame.
-func skipCell(termCols, termRows, ox, oy int) (x, y int) {
-	return termCols - 1 - ox, termRows - 1 - oy
-}
-
 // fitRegion places the source frame inside the dstCols×dstRows terminal grid.
 // stretch fills the whole terminal (simplest, may distort); letterbox preserves
 // the source's cols:rows ratio, centering it and leaving the margins blank. It
@@ -327,37 +330,6 @@ func fitRegion(srcCols, srcRows, dstCols, dstRows int, stretch bool) (w, h, ox, 
 	return w, h, (dstCols - w) / 2, (dstRows - h) / 2
 }
 
-// trueSGR tracks the fg/bg the terminal currently holds so a cell that shares
-// one of them with the cell before it sends only the half that changed
-// (~17 bytes saved per such cell; the full pair is ~37 of a cell's ~38 bytes).
-type trueSGR struct {
-	fg, bg [3]byte
-	ok     bool
-}
-
-func (s *trueSGR) write(buf *bytes.Buffer, cell []byte) {
-	var fg, bg [3]byte
-	copy(fg[:], cell[:3])
-	copy(bg[:], cell[3:6])
-	sameFg := s.ok && s.fg == fg
-	sameBg := s.ok && s.bg == bg
-	if sameFg && sameBg {
-		return
-	}
-	buf.WriteString("\x1b[")
-	if !sameFg {
-		fmt.Fprintf(buf, "38;2;%d;%d;%d", fg[0], fg[1], fg[2])
-	}
-	if !sameFg && !sameBg {
-		buf.WriteByte(';')
-	}
-	if !sameBg {
-		fmt.Fprintf(buf, "48;2;%d;%d;%d", bg[0], bg[1], bg[2])
-	}
-	buf.WriteByte('m')
-	s.fg, s.bg, s.ok = fg, bg, true
-}
-
 func absDiff(a, b byte) int {
 	if a > b {
 		return int(a - b)
@@ -376,21 +348,76 @@ func withinThr(prev, top, bot []byte, thr int) bool {
 	return true
 }
 
-// renderTrue emits 24-bit color half-blocks, redrawing only changed cells. It
-// resamples the srcCols×srcRows source frame into a dstCols×dstRows render
-// region placed at terminal offset (ox,oy) — letterbox margins are simply cells
-// we never draw. Returns the new per-cell token buffer (6 bytes/cell, sized to
-// the render region) for the next delta.
+// glyphSet holds the four cell glyphs the colour renderers choose between,
+// in the caller's encoding.
+type glyphSet struct{ upper, lower, full, space []byte }
+
+func glyphsFor(cp437 bool) glyphSet {
+	if cp437 {
+		return glyphSet{upper: []byte{0xDF}, lower: []byte{0xDC}, full: []byte{0xDB}, space: []byte{' '}}
+	}
+	return glyphSet{upper: []byte("▀"), lower: []byte("▄"), full: []byte("█"), space: []byte{' '}}
+}
+
+// renderTrue emits 24-bit colour half-blocks; render256 the same picture on
+// the xterm 256-colour palette (about 14 bytes of SGR per changed cell
+// instead of about 37). Both redraw only changed cells. See renderRGB.
+func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, gl glyphSet, m cellMask, thr int) []byte {
+	return renderRGB(buf, px, srcCols, srcRows, dstCols, dstRows, ox, oy, prev, gl, m, thr, false)
+}
+
+func render256(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, gl glyphSet, m cellMask, thr int) []byte {
+	return renderRGB(buf, px, srcCols, srcRows, dstCols, dstRows, ox, oy, prev, gl, m, thr, true)
+}
+
+// renderRGB resamples the srcCols x srcRows source frame into a
+// dstCols x dstRows region at terminal offset (ox,oy); letterbox margins are
+// cells it never draws. It returns the per-cell token buffer (the 6 bytes of
+// top/bottom source colour the caller is shown) for the next delta.
 //
-// thr is the noise gate: a cell whose colors all moved by at most thr per
+// thr is the noise gate: a cell whose colours all moved by at most thr per
 // channel from what the caller already shows is left alone and keeps its
-// displayed value in the returned buffer, so the comparison is always against
-// the screen and the error never exceeds thr. With the exact delta (thr 0) a
-// camera's +-2 sensor flicker made every frame a full repaint of every cell.
-func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev, glyph []byte, skipX, skipY, thr int) []byte {
+// displayed value, so the comparison is always against the screen and the
+// error never exceeds thr. With the exact delta (thr 0) a camera's +-2
+// sensor flicker made every frame a full repaint of every cell.
+//
+// Byte savings that change no pixel: a hop along the same row is a
+// cursor-forward (ESC[nC) rather than a full position; a cell whose halves
+// are one colour is a space on that background (or a full block in the
+// current foreground); and the upper or lower half block is chosen so the
+// cell reuses whichever of the terminal's current fg/bg it can.
+func renderRGB(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, gl glyphSet, m cellMask, thr int, pal256 bool) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	cur := make([]byte, dstRows*dstCols*6)
-	var sgr trueSGR
+	// A colour key is what the terminal is told: packed RGB for truecolor,
+	// the palette index (+1<<24, so it can't collide) for 256.
+	key := func(c []byte) uint32 {
+		if pal256 {
+			return 1<<24 | uint32(nearest256(int(c[0]), int(c[1]), int(c[2])))
+		}
+		return uint32(c[0])<<16 | uint32(c[1])<<8 | uint32(c[2])
+	}
+	var fg, bg uint32
+	haveFg, haveBg := false, false
+	setColour := func(k uint32, back bool) {
+		layer := 38
+		if back {
+			layer = 48
+		}
+		if k&(1<<24) != 0 {
+			fmt.Fprintf(buf, "\x1b[%d;5;%dm", layer, k&0xFF)
+		} else {
+			fmt.Fprintf(buf, "\x1b[%d;2;%d;%d;%dm", layer, k>>16, k>>8&0xFF, k&0xFF)
+		}
+	}
+	setBoth := func(f, b uint32) {
+		if f&(1<<24) != 0 {
+			fmt.Fprintf(buf, "\x1b[38;5;%d;48;5;%dm", f&0xFF, b&0xFF)
+		} else {
+			fmt.Fprintf(buf, "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm", f>>16, f>>8&0xFF, f&0xFF, b>>16, b>>8&0xFF, b&0xFF)
+		}
+		fg, bg, haveFg, haveBg = f, b, true, true
+	}
 	curRow, curCol := -1, -1
 	for y := 0; y < dstRows; y++ {
 		spTop, spBot := rowMap[2*y], rowMap[2*y+1]
@@ -399,20 +426,62 @@ func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 			tp := (spTop*srcCols + sx) * 3
 			bp := (spBot*srcCols + sx) * 3
 			ci := (y*dstCols + x) * 6
-			if prev != nil && withinThr(prev[ci:ci+6], px[tp:tp+3], px[bp:bp+3], thr) {
+			forced := m.forced(x+ox, y+oy)
+			if prev != nil && !forced && withinThr(prev[ci:ci+6], px[tp:tp+3], px[bp:bp+3], thr) {
 				copy(cur[ci:ci+6], prev[ci:ci+6]) // keep what the caller shows
 				continue
 			}
 			copy(cur[ci:ci+3], px[tp:tp+3])
 			copy(cur[ci+3:ci+6], px[bp:bp+3])
-			if x == skipX && y == skipY {
-				continue // the terminal's bottom-right cell: see skipCell
+			if m.skipped(x+ox, y+oy) {
+				continue // under an overlay, or the bottom-right cell (skipCell)
 			}
-			if curRow != y || curCol != x {
+			tk, bk := key(cur[ci:ci+3]), key(cur[ci+3:ci+6])
+			if prev != nil && !forced && pal256 && tk == key(prev[ci:ci+3]) && bk == key(prev[ci+3:ci+6]) {
+				continue // moved past the gate but lands on the same palette entries
+			}
+			if curRow == y && x > curCol { // ESC[nC is always shorter than ESC[r;cH
+				if d := x - curCol; d == 1 {
+					buf.WriteString("\x1b[C")
+				} else {
+					fmt.Fprintf(buf, "\x1b[%dC", d)
+				}
+			} else if curRow != y || curCol != x {
 				fmt.Fprintf(buf, "\x1b[%d;%dH", y+1+oy, x+1+ox)
 			}
-			sgr.write(buf, cur[ci:ci+6])
-			buf.Write(glyph)
+			switch {
+			case tk == bk && haveBg && bg == tk:
+				buf.Write(gl.space)
+			case tk == bk && haveFg && fg == tk:
+				buf.Write(gl.full)
+			case tk == bk:
+				setColour(tk, true)
+				bg, haveBg = tk, true
+				buf.Write(gl.space)
+			case haveFg && haveBg && fg == tk && bg == bk:
+				buf.Write(gl.upper)
+			case haveFg && haveBg && fg == bk && bg == tk:
+				buf.Write(gl.lower)
+			case haveFg && fg == tk:
+				setColour(bk, true)
+				bg, haveBg = bk, true
+				buf.Write(gl.upper)
+			case haveBg && bg == bk:
+				setColour(tk, false)
+				fg, haveFg = tk, true
+				buf.Write(gl.upper)
+			case haveBg && bg == tk:
+				setColour(bk, false)
+				fg, haveFg = bk, true
+				buf.Write(gl.lower)
+			case haveFg && fg == bk:
+				setColour(tk, true)
+				bg, haveBg = tk, true
+				buf.Write(gl.lower)
+			default:
+				setBoth(tk, bk)
+				buf.Write(gl.upper)
+			}
 			curRow, curCol = y, x+1
 			if curCol >= dstCols {
 				curRow, curCol = -1, -1
@@ -424,9 +493,9 @@ func renderTrue(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 
 // renderCGA emits CP437 + 16-color half-blocks (the BBS path), resampling the
 // source frame into a dstCols×dstRows region at terminal offset (ox,oy). 1 byte/cell.
-func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, dither bool, glyph []byte, skipX, skipY int) []byte {
+func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, dither bool, glyph []byte, m cellMask, thr int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
-	cur := make([]byte, dstRows*dstCols)
+	cur := make([]byte, dstRows*dstCols*cgaTok)
 	lastSGR := ""
 	curRow, curCol := -1, -1
 	for y := 0; y < dstRows; y++ {
@@ -435,15 +504,24 @@ func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows,
 			sx := colMap[x]
 			tp := (spTop*srcCols + sx) * 3
 			bp := (spBot*srcCols + sx) * 3
+			ci := (y*dstCols + x) * cgaTok
+			forced := m.forced(x+ox, y+oy)
+			// Noise gate, as in renderRGB: quantizing re-decides a cell on
+			// every +-2 of camera flicker, so gate on the source colours.
+			if prev != nil && !forced && withinThr(prev[ci:ci+6], px[tp:tp+3], px[bp:bp+3], thr) {
+				copy(cur[ci:ci+cgaTok], prev[ci:ci+cgaTok])
+				continue
+			}
 			top := quantCGA(int(px[tp]), int(px[tp+1]), int(px[tp+2]), x, 2*y, sat, dither)
 			bot := quantCGA(int(px[bp]), int(px[bp+1]), int(px[bp+2]), x, 2*y+1, sat, dither)
 			v := byte(top<<4 | bot)
-			ci := y*dstCols + x
-			cur[ci] = v
-			if x == skipX && y == skipY {
-				continue // the terminal's bottom-right cell: see skipCell
+			copy(cur[ci:ci+3], px[tp:tp+3])
+			copy(cur[ci+3:ci+6], px[bp:bp+3])
+			cur[ci+6] = v
+			if m.skipped(x+ox, y+oy) {
+				continue // under an overlay, or the bottom-right cell (skipCell)
 			}
-			if prev != nil && prev[ci] == v {
+			if prev != nil && !forced && prev[ci+6] == v {
 				continue
 			}
 			if curRow != y || curCol != x {
@@ -463,6 +541,13 @@ func renderCGA(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows,
 	return cur
 }
 
+// Delta token sizes: the 6 bytes of source colour the noise gate compares
+// against, then the cell as drawn (CGA: attr; shade: glyph, attr).
+const (
+	cgaTok   = 7
+	shadeTok = 8
+)
+
 // shadeQ is the perceptual 16-colour quantizer (github.com/hmderdoc/shadecell):
 // per cell it picks a space, full block, shade glyph or half block with the
 // fg/bg pair whose eye-mixed colour is closest in Oklab, so the 16-colour
@@ -475,9 +560,9 @@ var shadeQ = shadecell.New()
 // applies before quantizing like renderCGA; no ordered dither, the shade
 // glyphs do that job. cp437 selects raw CP437 bytes, otherwise the Unicode
 // block characters.
-func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, cp437 bool, skipX, skipY int) []byte {
+func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, sat float64, cp437 bool, m cellMask, thr int) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
-	cur := make([]byte, dstRows*dstCols*2)
+	cur := make([]byte, dstRows*dstCols*shadeTok)
 	lastSGR := ""
 	curRow, curCol := -1, -1
 	for y := 0; y < dstRows; y++ {
@@ -486,6 +571,17 @@ func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRow
 			sx := colMap[x]
 			tp := (spTop*srcCols + sx) * 3
 			bp := (spBot*srcCols + sx) * 3
+			ci := (y*dstCols + x) * shadeTok
+			forced := m.forced(x+ox, y+oy)
+			// Noise gate on the source colours (see renderCGA): without it
+			// nearly every cell flipped between near-equal shade choices on
+			// every frame of a live camera.
+			if prev != nil && !forced && withinThr(prev[ci:ci+6], px[tp:tp+3], px[bp:bp+3], thr) {
+				copy(cur[ci:ci+shadeTok], prev[ci:ci+shadeTok])
+				continue
+			}
+			copy(cur[ci:ci+3], px[tp:tp+3])
+			copy(cur[ci+3:ci+6], px[bp:bp+3])
 			tr, tg, tb := int(px[tp]), int(px[tp+1]), int(px[tp+2])
 			br, bg, bb := int(px[bp]), int(px[bp+1]), int(px[bp+2])
 			if sat != 1.0 {
@@ -493,12 +589,11 @@ func renderShade(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRow
 				br, bg, bb = saturate(br, bg, bb, sat)
 			}
 			c := shadeQ.Pair(shadecell.RGB{R: uint8(tr), G: uint8(tg), B: uint8(tb)}, shadecell.RGB{R: uint8(br), G: uint8(bg), B: uint8(bb)})
-			ci := (y*dstCols + x) * 2
-			cur[ci], cur[ci+1] = c.Ch, c.Attr
-			if x == skipX && y == skipY {
-				continue // the terminal's bottom-right cell: see skipCell
+			cur[ci+6], cur[ci+7] = c.Ch, c.Attr
+			if m.skipped(x+ox, y+oy) {
+				continue // under an overlay, or the bottom-right cell (skipCell)
 			}
-			if prev != nil && prev[ci] == c.Ch && prev[ci+1] == c.Attr {
+			if prev != nil && !forced && prev[ci+6] == c.Ch && prev[ci+7] == c.Attr {
 				continue
 			}
 			if curRow != y || curCol != x {
@@ -604,7 +699,7 @@ func rampGlyphs(rampID int, cp437 bool) [][]byte {
 // renderRamp maps each cell's brightness to a ramp glyph, colored by the cell's
 // average color. Delta token per cell: truecolor [r,g,b,glyphIdx] (4B), 16-color
 // [cgaIdx,glyphIdx] (2B). Glyph is foreground only (background stays default).
-func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, use16 bool, sat float64, dither bool, glyphs [][]byte, skipX, skipY int) []byte {
+func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows, ox, oy int, prev []byte, use16 bool, sat float64, dither bool, glyphs [][]byte, m cellMask) []byte {
 	colMap, rowMap := sampleMaps(srcCols, srcRows, dstCols, dstRows)
 	ng := len(glyphs)
 	stride := 4
@@ -638,10 +733,10 @@ func renderRamp(buf *bytes.Buffer, px []byte, srcCols, srcRows, dstCols, dstRows
 				cur[ci], cur[ci+1], cur[ci+2], cur[ci+3] = byte(r), byte(g), byte(b), byte(gi)
 				sgr = fmt.Sprintf("38;2;%d;%d;%d", r, g, b)
 			}
-			if x == skipX && y == skipY {
-				continue // the terminal's bottom-right cell: see skipCell
+			if m.skipped(x+ox, y+oy) {
+				continue // under an overlay, or the bottom-right cell (skipCell)
 			}
-			if prev != nil && bytes.Equal(prev[ci:ci+stride], cur[ci:ci+stride]) {
+			if prev != nil && !m.forced(x+ox, y+oy) && bytes.Equal(prev[ci:ci+stride], cur[ci:ci+stride]) {
 				continue
 			}
 			if curRow != y || curCol != x {
@@ -766,7 +861,7 @@ func main() {
 	port := flag.Int("port", 7601, "service consumer port")
 	channel := flag.String("channel", "cam", "channel to subscribe to")
 	encoding := flag.String("encoding", "cp437", "half-block glyph: cp437 (byte 0xDF) | utf8 (▀)")
-	color := flag.String("color", "auto", "color depth: auto (probe the terminal) | truecolor (24-bit) | 16 (CGA/ANSI)")
+	color := flag.String("color", "auto", "color depth: auto (probe the terminal) | truecolor (24-bit) | 256 (xterm palette) | 16 (CGA/ANSI); callers can switch with C")
 	fit := flag.String("fit", "letterbox", "fit to caller terminal: letterbox (keep aspect, centered) | stretch (fill)")
 	forceCols := flag.Int("termcols", 0, "force caller terminal width (0 = auto-detect via CPR probe)")
 	forceRows := flag.Int("termrows", 0, "force caller terminal height (0 = auto-detect via CPR probe)")
@@ -775,7 +870,7 @@ func main() {
 	shade := flag.Bool("shade", true, "16-color: pick shade glyphs (░▒▓) and half blocks per cell perceptually (shadeans); false = plain dithered half blocks")
 	fps := flag.Float64("fps", 15.0, "max render frames/sec")
 	delta := flag.Int("delta", 10, "truecolor noise gate: leave a cell alone while its colors move <= this much per channel (0 = exact delta)")
-	hint := flag.Bool("hint", true, "show a brief 'Q/X/ENTER to quit' hint at startup")
+	hint := flag.Bool("hint", true, "open the key-help dialog at startup (it closes on any key)")
 	frames := flag.Int("frames", 0, "exit after N rendered frames (0=forever)")
 	iniPath := flag.String("ini", defaultINIPath(), "optional .ini config (read at launch)")
 	debugPath := flag.String("debug", "", "write a diagnostic log to this file (e.g. to debug input)")
@@ -899,10 +994,12 @@ func main() {
 	if cp437enc {
 		glyph = []byte{0xDF} // ▀ in code page 437, for SyncTERM/classic terminals
 	}
-	use16, colorAuto := false, false
+	use16, use256, colorAuto := false, false, false
 	switch strings.ToLower(strings.TrimSpace(*color)) {
 	case "16", "cga", "ansi", "ansi16":
 		use16 = true
+	case "256":
+		use256 = true
 	case "", "auto":
 		colorAuto = true // decided by the terminal probe below, once the tty is raw
 	}
@@ -931,7 +1028,7 @@ func main() {
 	// Hide cursor + DISABLE auto-wrap (DECAWM). With auto-wrap on, writing the
 	// last cell of the bottom row makes the terminal scroll up one line. Not
 	// every terminal honors ?7l (CTerm/SyncTERM ignores it), so this is only
-	// belt: the braces are skipCell, which keeps the renderers and the caption
+	// belt: the braces are cornerMask, which keeps the renderers and the caption
 	// bar out of the bottom-right cell altogether.
 	fmt.Fprint(out, "\x1b[?25l\x1b[?7l")
 
@@ -971,7 +1068,7 @@ func main() {
 		if audio.enabled {
 			yn = "yes"
 		}
-		dbg.Printf("libsndfile: %s (audio=%s channel=%d)", yn, audio.cfg.Mode, audio.cfg.Channel)
+		dbg.Printf("libsndfile: %s (audio=%s channel=%d codec=%s)", yn, audio.cfg.Mode, audio.cfg.Channel, audio.codecName())
 	}
 	// Colour depth: color = auto asks the terminal in band (XTVERSION, DECRQSS,
 	// XTSMGRAPHICS, Device Attributes; github.com/hmderdoc/termprobe), still
@@ -1062,10 +1159,30 @@ func main() {
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigc; quit(0) }()
 
-	// Input reader. Quit keys are Q, X, and ENTER (plus Ctrl-C); a *lone* ESC
-	// still quits as a courtesy, but ESC is no longer the primary quit because a
-	// CPR size report STARTS with ESC — the old `case 27: quit` would have quit
-	// on the first byte of every report. keyParser does the byte-level parsing.
+	// Keys for the render loop, which owns the dialog, colour mode and frame
+	// rate. helpOpen mirrors whether the dialog is up, so the reader knows
+	// whether Escape closes it or quits.
+	uiKeys := make(chan byte, 32)
+	var helpOpen atomic.Bool
+	sendKey := func(c byte) {
+		select {
+		case uiKeys <- c:
+		default: // a burst of keys faster than the loop: drop, never block input
+		}
+	}
+	escape := func() {
+		if helpOpen.Load() {
+			sendKey(27)
+		} else {
+			quit(0)
+		}
+	}
+
+	// Input reader. Quit keys are Q and X (plus Ctrl-C); a *lone* ESC closes
+	// the help dialog, or quits when it isn't up. ESC is not a plain key
+	// because a CPR size report STARTS with ESC — the old `case 27: quit` would
+	// have quit on the first byte of every report. keyParser does the
+	// byte-level parsing; every other key goes to the render loop (uiKey).
 	go func() {
 		if dbg != nil {
 			dbg.Printf("input reader started (fd %d)", input.Fd())
@@ -1097,11 +1214,11 @@ func main() {
 					}
 				}
 			case keyMute:
-				// The flush that silences playback rides the next tick.
-				muted := audio.toggleMute()
-				if dbg != nil {
-					dbg.Printf("mute toggled: %v", muted)
-				}
+				sendKey('m')
+			case keyEscape:
+				escape()
+			case keyPress:
+				sendKey(kp.key)
 			}
 		}
 		// Keys the caller typed while the colour probe was listening.
@@ -1120,7 +1237,9 @@ func main() {
 				// pressing Escape (a CPR/arrow burst arrives back-to-back, so it
 				// won't sit half-parsed this long).
 				if kp.awaitingEscape() && !escAt.IsZero() && time.Since(escAt) > 80*time.Millisecond {
-					quit(0)
+					kp.escapeTimedOut()
+					escAt = time.Time{}
+					escape()
 				}
 				time.Sleep(20 * time.Millisecond)
 				continue
@@ -1193,7 +1312,8 @@ func main() {
 	var audioIn [][]byte // AUDIO messages awaiting emission (bounded, drop-oldest)
 	const audioInMax = 32
 	dirty, eof := false, false
-	go func() { // keep only the latest frame (drop-to-latest); queue audio
+	lastFrameAt := time.Now() // newest FRAME from the relay; drives off-air
+	go func() {               // keep only the latest frame (drop-to-latest); queue audio
 		for {
 			p, err := readMsg(conn)
 			if err != nil {
@@ -1210,6 +1330,7 @@ func main() {
 				mu.Lock()
 				latest = p
 				dirty = true
+				lastFrameAt = time.Now()
 				mu.Unlock()
 			case msgAudio:
 				// The ledger in audioSession is the real backpressure; this
@@ -1233,8 +1354,42 @@ func main() {
 	renderSig := ""
 	rendered := 0
 	var holdSince time.Time // how long the A/V gate has been holding video
-	hintDeadline := time.Now().Add(5 * time.Second)
-	hintCleared := !*hint
+
+	// What the caller has picked with the keys (uiKey), and the chrome drawn
+	// over the picture (ui.go). The help dialog opens by itself at startup
+	// (hint = true) and closes on any key, or on its own after splashFor.
+	colourMode := colourTrue
+	if use16 {
+		colourMode = colour16
+	} else if use256 {
+		colourMode = colour256
+	}
+	gl := glyphsFor(cp437enc)
+	fpsCap := *fps
+	showHelp := *hint
+	var helpAuto time.Time
+	if showHelp {
+		helpAuto = time.Now().Add(splashFor)
+	}
+	helpOpen.Store(showHelp)
+	var toastText string
+	var toastUntil time.Time
+	offAir := false
+	var offAirAt time.Time // last off-air repaint
+	var card []byte        // the off-air test card, as a FRAME payload
+	var lastF []byte       // the last frame painted, repainted when only the chrome changed
+	repaint := false       // the picture must be redrawn (colour mode changed)
+	shownKey := ""         // the chrome currently on screen
+	var shownRects []rect
+	var pendingForce []rect // cells an overlay covered until just now
+	needChrome := false
+
+	toast := func(t string) { toastText, toastUntil = t, time.Now().Add(toastFor) }
+	noSound := func() { toast("No sound on this terminal") }
+	setHelp := func(open bool) {
+		showHelp, helpAuto = open, time.Time{}
+		helpOpen.Store(open)
+	}
 
 	// The output queue is a list of UNITS, each safe to separate from its
 	// neighbors (a whole small write, or a frame segment cut at an escape
@@ -1251,7 +1406,7 @@ func main() {
 	var cur []byte // unit currently flushing (nil = none)
 	curOff := 0
 	curFrameEnd := false
-	minInterval := time.Duration(float64(time.Second) / *fps)
+	minInterval := time.Duration(float64(time.Second) / fpsCap)
 	var lastStart time.Time
 	// Re-probe the terminal size ~1/sec for live resize. The probe goes out as
 	// its own unit, so it never splits a frame; it's NOT gated on a fresh
@@ -1281,6 +1436,51 @@ func main() {
 	// to fit. Comfortably longer than the gap between 4 KB unit writes.
 	const busyIdle = 250 * time.Millisecond
 	lastFrameBytes := 8192 // refined after each render; sizes the gate
+
+	// uiKey acts on one key from the reader. With the dialog up, any key
+	// just closes it (Q, X and Ctrl-C quit in the reader before getting here).
+	uiKey := func(c byte) {
+		if showHelp {
+			setHelp(false)
+			return
+		}
+		switch c {
+		case 'c', 'C':
+			colourMode = (colourMode + 1) % 3
+			repaint = true
+			toast("Color mode: " + colourNames[colourMode])
+		case '+', '=':
+			if db, ok := audio.adjustVolume(volumeStepDB); ok {
+				toast(fmt.Sprintf("Volume %d dB", db))
+			} else {
+				noSound()
+			}
+		case '-', '_':
+			if db, ok := audio.adjustVolume(-volumeStepDB); ok {
+				toast(fmt.Sprintf("Volume %d dB", db))
+			} else {
+				noSound()
+			}
+		case 'm', 'M':
+			// The flush that silences playback rides the next audio tick.
+			if !audio.isEnabled() {
+				noSound()
+			} else if audio.toggleMute() {
+				toast("Muted")
+			} else {
+				toast("Sound on")
+			}
+		case 'f', 'F':
+			fpsCap = nextFPS(fpsCap)
+			minInterval = time.Duration(float64(time.Second) / fpsCap)
+			toast(fmt.Sprintf("Frame rate: %g fps", fpsCap))
+		default: // '?' and every key with no job of its own
+			setHelp(true)
+		}
+		if dbg != nil {
+			dbg.Printf("key %q: colour=%s fps=%g help=%v", c, colourNames[colourMode], fpsCap, showHelp)
+		}
+	}
 
 	for {
 		didWork := false
@@ -1423,10 +1623,29 @@ func main() {
 			lastReport = time.Now()
 		}
 
-		// 3. Queue idle and a fresh frame is ready (and the fps cap allows)?
-		//    Render the LATEST one, discarding any we skipped while the last
-		//    frame drained.
+		// 3. Queue idle: paint whatever is due — a fresh frame (if the fps
+		//    cap and the link budget allow), the off-air card, or a repaint
+		//    because the chrome over the picture changed.
 		if cur == nil && len(outq) == 0 {
+		keys:
+			for {
+				select {
+				case c := <-uiKeys:
+					uiKey(c)
+				default:
+					break keys
+				}
+			}
+			now := time.Now()
+			if showHelp && !helpAuto.IsZero() && now.After(helpAuto) {
+				setHelp(false)
+			}
+			if toastText != "" && now.After(toastUntil) {
+				toastText = ""
+			}
+			dstCols := int(termCols.Load())
+			dstRows := int(termRows.Load())
+
 			// Governor gate: take a frame only when the budget covers one
 			// (sized by the previous paint). An ungated frame here would
 			// refill the downstream buffers and put audio behind them again.
@@ -1437,16 +1656,70 @@ func main() {
 			e := eof
 			var f []byte
 			haveNew := false
-			if dirty && budgetOK {
+			if dirty && budgetOK && now.Sub(lastStart) >= minInterval {
 				f, haveNew, dirty = latest, true, false
 			}
+			sinceFrame := now.Sub(lastFrameAt)
 			mu.Unlock()
 			if e {
 				break
 			}
+			if wasOff := offAir; (sinceFrame > offAirAfter) != wasOff {
+				offAir = !wasOff
+				if dbg != nil {
+					dbg.Printf("off air: %v (last frame %s ago)", offAir, sinceFrame.Round(time.Millisecond))
+				}
+			}
+
+			// The chrome wanted on screen now, bottom to top. When it differs
+			// from what is shown, the cells the old chrome covered are
+			// repainted (pendingForce) and the new chrome is drawn.
+			var want []overlay
+			if offAir {
+				want = append(want, offAirOverlay(dstCols, dstRows, cp437enc))
+			}
+			if toastText != "" {
+				want = append(want, toastOverlay(toastText, dstCols))
+			}
+			if showHelp {
+				want = append(want, helpOverlay(dstCols, dstRows, cp437enc))
+			}
+			wantKey := fmt.Sprintf("%dx%d", dstCols, dstRows)
+			var wantRects []rect
+			for _, o := range want {
+				wantKey += fmt.Sprintf("|%s%v", o.id, o.r)
+				wantRects = append(wantRects, o.r)
+			}
+			if wantKey != shownKey {
+				pendingForce = append(pendingForce, shownRects...)
+				shownKey, shownRects, needChrome = wantKey, wantRects, true
+			}
+
+			// Pick what to paint.
+			var src []byte
+			gated, isCard := false, false
+			switch {
+			case haveNew:
+				src, gated = f, true
+			case offAir && (repaint || needChrome || len(pendingForce) > 0 || now.Sub(offAirAt) >= time.Second):
+				cols, rows := 80, 24
+				if len(lastF) >= 5 {
+					cols, rows = int(binary.BigEndian.Uint16(lastF[1:3])), int(binary.BigEndian.Uint16(lastF[3:5]))
+				}
+				if len(card) < 5 || int(binary.BigEndian.Uint16(card[1:3])) != cols || int(binary.BigEndian.Uint16(card[3:5])) != rows {
+					card = cardFrame(cols, rows)
+				}
+				src, isCard = card, true
+				offAirAt = now
+			case !offAir && lastF != nil && (repaint || len(pendingForce) > 0):
+				src = lastF
+			}
+
 			var buf bytes.Buffer
 			builtFrame := false
-			if haveNew && time.Since(lastStart) >= minInterval && len(f) >= 9 {
+			fullRepaint := false
+			if len(src) >= 9 {
+				f := src
 				srcCols := int(binary.BigEndian.Uint16(f[1:3]))
 				srcRows := int(binary.BigEndian.Uint16(f[3:5]))
 				mode := int(f[5])
@@ -1460,8 +1733,6 @@ func main() {
 				}
 				// Destination is THIS caller's terminal (from CPR), not the
 				// producer's resolution — that's what makes the door responsive.
-				dstCols := int(termCols.Load())
-				dstRows := int(termRows.Load())
 				// Letterbox (or stretch) the source into the terminal grid.
 				fitCols, fitRows, ox, oy := fitRegion(srcCols, srcRows, dstCols, dstRows, stretchFit)
 				pixelBytes := 2 * srcRows * srcCols * 3
@@ -1470,8 +1741,9 @@ func main() {
 				// frame > sync_slack_ms behind is dropped (fresher one is
 				// coming), one > sync_slack_ms ahead is held for the next
 				// tick. Audio is never stretched or re-timed to compensate.
+				// Repaints of an already-shown frame are not gated.
 				skipFrame := false
-				if audio.enabled && len(px) >= pixelBytes+8 {
+				if gated && audio.enabled && len(px) >= pixelBytes+8 {
 					framePts := int64(binary.BigEndian.Uint64(px[pixelBytes : pixelBytes+8]))
 					verdict := audio.videoGate(framePts, time.Now())
 					// Bounded hold: whatever the audio clock thinks, video
@@ -1499,33 +1771,35 @@ func main() {
 					}
 				}
 				if !skipFrame && len(px) >= pixelBytes && srcCols > 0 && srcRows > 0 {
-					if !hintCleared && time.Now().After(hintDeadline) {
-						prev = nil
-						hintCleared = true
-					}
 					// A change in source dims, the caller's terminal size (which
-					// moves the letterbox region), mode/ramp/color, or the caption
+					// moves the letterbox region), mode/ramp/colour, or the caption
 					// appearing/disappearing invalidates the delta — force a full
 					// clear + repaint. The clear also wipes stale letterbox margins.
-					sig := fmt.Sprintf("%d-%d-%d-%d-%d-%d-%v-%v",
-						srcCols, srcRows, dstCols, dstRows, mode, rampID, use16, len(caption) > 0)
+					sig := fmt.Sprintf("%d-%d-%d-%d-%d-%d-%d-%v",
+						srcCols, srcRows, dstCols, dstRows, mode, rampID, colourMode, len(caption) > 0)
 					if sig != renderSig {
 						prev = nil
 						renderSig = sig
 					}
 					if prev == nil {
-						buf.WriteString("\x1b[2J\x1b[H")
+						buf.WriteString("\x1b[0m\x1b[2J\x1b[H")
+						fullRepaint = true
 					}
-					skipX, skipY := skipCell(dstCols, dstRows, ox, oy)
-					if mode == 1 {
-						prev = renderRamp(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, use16, *sat, *dither, rampGlyphs(rampID, cp437enc), skipX, skipY)
-					} else if use16 && *shade {
-						prev = renderShade(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, cp437enc, skipX, skipY)
-					} else if use16 {
-						prev = renderCGA(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, *dither, glyph, skipX, skipY)
-					} else {
-						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, glyph, skipX, skipY, *delta)
+					m := cellMask{cornerX: dstCols - 1, cornerY: dstRows - 1, skip: wantRects, force: pendingForce}
+					switch {
+					case mode == 1:
+						prev = renderRamp(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, colourMode == colour16, *sat, *dither, rampGlyphs(rampID, cp437enc), m)
+					case colourMode == colour16 && *shade:
+						prev = renderShade(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, cp437enc, m, *delta)
+					case colourMode == colour16:
+						prev = renderCGA(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, *sat, *dither, glyph, m, *delta)
+					case colourMode == colour256:
+						prev = render256(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, gl, m, *delta)
+					default:
+						prev = renderTrue(&buf, px, srcCols, srcRows, fitCols, fitRows, ox, oy, prev, gl, m, *delta)
 					}
+					pendingForce = nil
+					repaint = false
 					if len(caption) > 0 {
 						// Place the bar on the row just below the image; if the
 						// image is full height (no bottom margin) overlay its last
@@ -1536,25 +1810,41 @@ func main() {
 						}
 						// On the bottom row the bar must stop one cell short of
 						// the right edge: the bottom-right cell scrolls the
-						// screen (see skipCell).
+						// screen (see cornerMask).
 						capWidth := fitCols
 						if capRow == dstRows && ox+capWidth >= dstCols {
 							capWidth = dstCols - 1 - ox
 						}
 						if capWidth > 0 {
 							renderCaption(&buf, caption, ox, capRow, capWidth, cp437enc)
+							// On a small screen the bar can cross the chrome:
+							// put the chrome back on top.
+							for _, r := range wantRects {
+								if capRow-1 >= r.y && capRow-1 < r.y+r.h {
+									needChrome = true
+								}
+							}
 						}
 					}
-					if !hintCleared {
-						hintText := " Press Q, X or ENTER to quit "
-						if audio.enabled {
-							hintText = " Q/X/ENTER quit | M mute "
-						}
-						buf.WriteString("\x1b[1;1H\x1b[1;37;44m" + hintText + "\x1b[0m")
+					if !isCard {
+						lastF = src
 					}
-					lastStart = time.Now()
+					if gated {
+						lastStart = time.Now()
+					}
 					builtFrame = true
 				}
+			}
+			// The chrome goes on top of whatever was just painted. Before the
+			// first picture it goes onto a cleared screen.
+			if needChrome || fullRepaint {
+				if renderSig == "" && !builtFrame && len(want) > 0 {
+					buf.WriteString("\x1b[0m\x1b[2J")
+				}
+				for _, o := range want {
+					buf.Write(o.body)
+				}
+				needChrome = false
 			}
 			// Live-resize re-probe on a timer, NOT gated on a rendered frame:
 			// rides the frame buffer if we built one this tick, else goes out as a

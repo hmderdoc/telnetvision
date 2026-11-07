@@ -199,6 +199,10 @@ func (h *hub) clearProducer(name string, conn net.Conn) {
 	c.mu.Lock()
 	if c.producer == conn { // don't clear a newer producer that replaced us
 		c.producer = nil
+		// Forget its last frame too: replaying it to a door that joins
+		// later would show a frozen picture as if the channel were live.
+		// With nothing replayed the door's off-air card comes up instead.
+		c.latest = nil
 	}
 	c.mu.Unlock()
 }

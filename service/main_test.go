@@ -97,3 +97,22 @@ func TestVideoStaysDropToLatest(t *testing.T) {
 		t.Fatalf("latest = %v, want the newest frame only", s.latest)
 	}
 }
+
+// A producer that leaves takes its last frame with it, so a door joining
+// afterwards is not handed a stale picture; a newer producer's frame stays.
+func TestClearProducerDropsLatest(t *testing.T) {
+	h := newHub()
+	a, b := &net.TCPConn{}, &net.TCPConn{}
+	h.setProducer("cam", a)
+	h.publish("cam", []byte("frame"))
+	h.clearProducer("cam", a)
+	if h.get("cam").latest != nil {
+		t.Fatal("frame from a departed producer is still replayed to new subscribers")
+	}
+	h.setProducer("cam", b)
+	h.publish("cam", []byte("frame2"))
+	h.clearProducer("cam", a) // the old one's late cleanup must not touch b's frame
+	if h.get("cam").latest == nil {
+		t.Fatal("stale cleanup cleared the live producer's frame")
+	}
+}

@@ -88,7 +88,7 @@ func TestKeyParser_CPRRejected(t *testing.T) {
 }
 
 func TestKeyParser_QuitKeys(t *testing.T) {
-	for _, k := range []string{"q", "Q", "x", "X", "\r", "\n", "\x03"} {
+	for _, k := range []string{"q", "Q", "x", "X", "\x03"} {
 		events, _, _ := feedAll(k)
 		if len(events) != 1 || events[0] != keyQuit {
 			t.Errorf("feed(%q) = %v, want one keyQuit", k, events)
@@ -96,14 +96,46 @@ func TestKeyParser_QuitKeys(t *testing.T) {
 	}
 }
 
+// ENTER no longer quits: CR is an ordinary key (it opens the help dialog),
+// and the LF or NUL telnet sends after it is not a second key.
+func TestKeyParser_EnterIsAKey(t *testing.T) {
+	for _, k := range []string{"\r", "\r\n", "\r\x00"} {
+		events, _, kp := feedAll(k)
+		if len(events) != 1 || events[0] != keyPress || kp.key != '\r' {
+			t.Errorf("feed(%q) = %v key=%q, want one keyPress of CR", k, events, kp.key)
+		}
+	}
+	if events, _, _ := feedAll("\n"); len(events) != 0 {
+		t.Errorf("bare LF = %v, want nothing", events)
+	}
+}
+
+// Every other key reaches the dialog logic; cursor keys arrive as key 0.
+func TestKeyParser_OtherKeys(t *testing.T) {
+	for _, k := range []string{"?", "c", "F", "+", "-", " ", "z"} {
+		events, _, kp := feedAll(k)
+		if len(events) != 1 || events[0] != keyPress || kp.key != k[0] {
+			t.Errorf("feed(%q) = %v key=%q, want one keyPress", k, events, kp.key)
+		}
+	}
+	events, _, kp := feedAll("\x1b[A")
+	if len(events) != 1 || events[0] != keyPress || kp.key != 0 {
+		t.Errorf("up arrow = %v key=%d, want one keyPress of 0", events, kp.key)
+	}
+	// A mouse report or other CSI is not a key.
+	if events, _, _ := feedAll("\x1b[<0;10;5M"); len(events) != 0 {
+		t.Errorf("mouse report = %v, want nothing", events)
+	}
+}
+
 // A lone ESC byte leaves the parser pending (the goroutine's timeout, not feed,
-// decides it's a quit); an ESC followed by a non-sequence byte quits.
+// decides it's an Escape press); an ESC followed by a non-sequence byte is one.
 func TestKeyParser_EscHandling(t *testing.T) {
 	if events, _, kp := feedAll("\x1b"); len(events) != 0 || !kp.awaitingEscape() {
 		t.Errorf("lone ESC: events=%v awaiting=%v, want none/true", events, kp.awaitingEscape())
 	}
-	if events, _, _ := feedAll("\x1bZ"); len(events) != 1 || events[0] != keyQuit {
-		t.Errorf("ESC+Z: events=%v, want one keyQuit", events)
+	if events, _, _ := feedAll("\x1bZ"); len(events) != 1 || events[0] != keyEscape {
+		t.Errorf("ESC+Z: events=%v, want one keyEscape", events)
 	}
 }
 

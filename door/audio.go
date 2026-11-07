@@ -46,6 +46,22 @@ const (
 
 	featureProbe = "\x1b_SyncTERM:Q;libsndfile\x1b\\"
 
+	// Format probes (SyncTERM's Q;libsndfileFormat;<major>;<subtype>, reply
+	// ESC[=7;101;<major>;<subtype>;0|1n): may this caller's libsndfile
+	// decode WAV (major 1) holding IMA ADPCM (0x12) or u-law (0x10)? Builds
+	// that predate the query stay silent and keep getting 16-bit PCM WAV.
+	audioFormatFeatureID = 101
+	sfMajorWAV           = 1
+	sfSubIMAADPCM        = 0x12
+	sfSubULaw            = 0x10
+	formatProbe          = "\x1b_SyncTERM:Q;libsndfileFormat;1;18\x1b\\" +
+		"\x1b_SyncTERM:Q;libsndfileFormat;1;16\x1b\\"
+
+	// Caller volume keys (+/-): step and the range they may move within.
+	volumeStepDB = 3
+	volumeMinDB  = -45
+	volumeMaxDB  = 6
+
 	// query3DS identifies a 3dBBS caller — the Nintendo 3DS homebrew terminal.
 	// It answers `APC 3DS:Ver;<maj>;<min> ST`; every other terminal ignores an
 	// unknown APC entirely, so a missing reply simply means "not a handheld".
@@ -104,6 +120,7 @@ type audioConfig struct {
 	SlackMs    int    // A/V sync tolerance before video is dropped/held
 	VolumeDB   int    // A;Volume set once at session start
 	ResyncSecs int    // blind tail-cap interval (0 = off; see resyncLocked)
+	Codec      string // what the door sends the caller: "adpcm" | "ulaw" | "pcm"
 }
 
 func defaultAudioConfig() audioConfig {
@@ -117,6 +134,7 @@ func defaultAudioConfig() audioConfig {
 		SlackMs:    120,
 		VolumeDB:   -6,
 		ResyncSecs: 60,
+		Codec:      "adpcm",
 	}
 }
 
@@ -128,6 +146,12 @@ func audioConfigFromINI(ini map[string]string) audioConfig {
 		switch v {
 		case "auto", "on", "off":
 			cfg.Mode = v
+		}
+	}
+	if v, ok := ini["audio_codec"]; ok {
+		switch v {
+		case "adpcm", "ulaw", "pcm":
+			cfg.Codec = v
 		}
 	}
 	iniInt := func(key string, dst *int) {
@@ -197,6 +221,10 @@ type audioSession struct {
 	// query3DS. Set by detect(); read by the render loop.
 	is3DBBS bool
 
+	// Compressed WAV formats the caller's libsndfile said it decodes (see
+	// formatProbe). Set by detect(); false means 16-bit PCM WAV.
+	canIMA, canULaw bool
+
 	mu   sync.Mutex
 	slot int // next pool index to use (0..SlotCount-1)
 
@@ -237,6 +265,9 @@ type audioSession struct {
 	// flush rides the next tick — and must not gate video afterwards.
 	muted     bool
 	needFlush bool
+
+	// Caller volume (the + and - keys); the A;Volume rides the next tick.
+	needVolume bool
 
 	// Diagnostics (debug log only).
 	primes     int           // silence-primes after stream gaps (each = a gap)
@@ -306,7 +337,7 @@ func (s *audioSession) detect(in, out *os.File, timeout time.Duration) {
 	// SyncTERM answers only the first. Pairing them means the handheld check
 	// costs nothing extra when it IS a handheld, and at most query3DSGrace
 	// when it isn't.
-	if _, err := out.Write([]byte(featureProbe + query3DS)); err != nil {
+	if _, err := out.Write([]byte(featureProbe + formatProbe + query3DS)); err != nil {
 		s.enabled = false
 		return
 	}
@@ -323,6 +354,12 @@ func (s *audioSession) detect(in, out *os.File, timeout time.Duration) {
 		n, err := readTimeout(in, scratch, rem)
 		if n > 0 {
 			buf = append(buf, scratch[:n]...)
+			if avail, found := parseFormatReply(buf, sfMajorWAV, sfSubIMAADPCM); found {
+				s.canIMA = avail
+			}
+			if avail, found := parseFormatReply(buf, sfMajorWAV, sfSubULaw); found {
+				s.canULaw = avail
+			}
 			if !gotFeature {
 				if avail, found := parseFeatureReply(buf, audioFeatureID); found {
 					gotFeature, feature = true, avail
@@ -398,6 +435,21 @@ func parseDSRPairs(params []byte) (pairs [][2]int, ok bool) {
 		pairs = append(pairs, [2]int{vals[k], vals[k+1]})
 	}
 	return pairs, true
+}
+
+// parseFormatReply scans buf for a libsndfileFormat answer,
+// ESC [ = 7 ; 101 ; <major> ; <subtype> ; <0|1> n, for the given format.
+func parseFormatReply(buf []byte, major, subtype int) (avail, found bool) {
+	want := fmt.Sprintf("\x1b[=7;%d;%d;%d;", audioFormatFeatureID, major, subtype)
+	i := bytes.Index(buf, []byte(want))
+	if i < 0 {
+		return false, false
+	}
+	rest := buf[i+len(want):]
+	if len(rest) < 2 || rest[1] != 'n' {
+		return false, false
+	}
+	return rest[0] == '1', true
 }
 
 // parseFeatureReply scans a raw byte buffer for ESC [ = 7 ; <id> ; <state> n
@@ -515,23 +567,19 @@ func (s *audioSession) handleChunk(w io.Writer, m audioMsg, now time.Time) (queu
 		}
 	}
 
-	file := m.Payload
-	if m.Codec == codecRaw {
-		if s.is3DBBS {
-			// Halve the wire cost for the handheld. 3dBBS decodes WAV
-			// "PCM16/U8" natively (source/audio/apcaudio.c wavDecode) and
-			// answers Q;libsndfileFormat for the U8 subtype with 1, so this
-			// is a real format it asked for — not a downgrade it has to
-			// resample. 8-bit at 22050 Hz is well matched to its speaker,
-			// and unlike lowering the RATE it needs no resampler and cannot
-			// drift the clock: sample count and duration are unchanged.
-			file = encodeWAV8(m.Payload, int(m.SampleRate), int(m.Channels))
-		} else {
-			file = encodeWAV(m.Payload, int(m.SampleRate), int(m.Channels))
+	file, codec := m.Payload, m.Codec
+	switch m.Codec {
+	case codecRaw:
+		file, codec = s.encodeLocked(m.Payload, int(m.SampleRate), int(m.Channels)), codecWAV
+	case codecWAV:
+		// The producer's PCM WAV is re-encoded for the caller's link; any
+		// other WAV flavour (and FLAC) goes through untouched.
+		if pcm, rate, ch, ok := wavPCM16(m.Payload); ok {
+			file = s.encodeLocked(pcm, rate, ch)
 		}
 	}
 	if s.fillingLocked() {
-		s.fill = append(s.fill, heldChunk{file: file, codec: m.Codec, durMs: dur, pts: int64(m.PtsMs)})
+		s.fill = append(s.fill, heldChunk{file: file, codec: codec, durMs: dur, pts: int64(m.PtsMs)})
 		s.fillLast = now
 		if len(s.fill) < s.cfg.Prebuffer {
 			return false, nil // held; the burst goes out when the cushion is full
@@ -556,7 +604,7 @@ func (s *audioSession) handleChunk(w io.Writer, m audioMsg, now time.Time) (queu
 		s.needArm = false
 		s.primes++
 	}
-	if err := s.emitChunkLocked(w, file, m.Codec); err != nil {
+	if err := s.emitChunkLocked(w, file, codec); err != nil {
 		return false, err
 	}
 	s.emittedMs += dur
@@ -580,15 +628,9 @@ func (s *audioSession) primeSilenceLocked(w io.Writer, now time.Time) error {
 		silMs = 400
 	}
 	n := int(s.lastRate) * int(s.lastChannels) * 2 * int(silMs) / 1000
-	// Same format as the real chunks: the handheld's 8-bit path costs half
-	// the bytes, and a prime is emitted on every gap so it is not rare.
-	// (Silence is not all-zeroes in 8-bit WAV — encodeWAV8 biases it to 128.)
-	var sil []byte
-	if s.is3DBBS {
-		sil = encodeWAV8(make([]byte, n), int(s.lastRate), int(s.lastChannels))
-	} else {
-		sil = encodeWAV(make([]byte, n), int(s.lastRate), int(s.lastChannels))
-	}
+	// Same format as the real chunks: a prime is emitted on every gap, so
+	// it should cost what they cost.
+	sil := s.encodeLocked(make([]byte, n), int(s.lastRate), int(s.lastChannels))
 	if err := s.emitChunkLocked(w, sil, codecWAV); err != nil {
 		return err
 	}
@@ -596,6 +638,39 @@ func (s *audioSession) primeSilenceLocked(w io.Writer, now time.Time) error {
 	s.lastQueue = now
 	s.lastEmpty = now
 	return nil
+}
+
+// encodeLocked wraps interleaved S16LE PCM in the smallest WAV this caller
+// can play. The 3dBBS handheld gets unsigned 8-bit: it decodes WAV
+// "PCM16/U8" natively (source/audio/apcaudio.c wavDecode) and answers
+// Q;libsndfileFormat for the U8 subtype with 1, and 8-bit at 22050 Hz is
+// well matched to its speaker. A desktop SyncTERM gets IMA ADPCM (4 bits a
+// sample) or u-law (8 bits) when its libsndfile said it decodes them and the
+// sysop's audio_codec allows it, else 16-bit PCM. None of these changes the
+// sample rate or count, so the A/V clock is untouched.
+func (s *audioSession) encodeLocked(pcm []byte, rate, channels int) []byte {
+	switch {
+	case s.is3DBBS:
+		return encodeWAV8(pcm, rate, channels)
+	case s.cfg.Codec == "adpcm" && s.canIMA:
+		return encodeWAVIMA(pcm, rate, channels)
+	case (s.cfg.Codec == "adpcm" || s.cfg.Codec == "ulaw") && s.canULaw:
+		return encodeWAVULaw(pcm, rate, channels)
+	}
+	return encodeWAV(pcm, rate, channels)
+}
+
+// codecName names what encodeLocked will send, for the debug log.
+func (s *audioSession) codecName() string {
+	switch {
+	case s.is3DBBS:
+		return "wav-u8"
+	case s.cfg.Codec == "adpcm" && s.canIMA:
+		return "wav-ima-adpcm"
+	case (s.cfg.Codec == "adpcm" || s.cfg.Codec == "ulaw") && s.canULaw:
+		return "wav-ulaw"
+	}
+	return "wav-pcm16"
 }
 
 // resyncLocked is lameboy's periodic "engine restart", ported: when the
@@ -707,6 +782,41 @@ func (s *audioSession) toggleMute() (muted bool) {
 	return s.muted
 }
 
+// adjustVolume moves the caller's channel volume by deltaDB (the + and -
+// keys), clamped to volumeMinDB..volumeMaxDB, and returns the new level.
+// ok is false when audio is off. The A;Volume itself rides the next tick.
+func (s *audioSession) adjustVolume(deltaDB int) (db int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.enabled {
+		return 0, false
+	}
+	v := s.cfg.VolumeDB + deltaDB
+	if v < volumeMinDB {
+		v = volumeMinDB
+	}
+	if v > volumeMaxDB {
+		v = volumeMaxDB
+	}
+	s.cfg.VolumeDB = v
+	s.needVolume = true
+	return v, true
+}
+
+// isEnabled reports whether this caller gets audio at all.
+func (s *audioSession) isEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.enabled
+}
+
+// isMuted reports the M-key state.
+func (s *audioSession) isMuted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.muted
+}
+
 // onDSR digests audio DSR pairs from the input reader. A state-0 report for
 // our channel means the FIFO drained (the armed one-shot, or a poll reply
 // finding the channel idle): the ledger's lead is stale, so re-anchor to
@@ -769,6 +879,12 @@ func (s *audioSession) tick(w io.Writer, now time.Time) error {
 		s.playStart = now
 		s.emittedMs = 0
 		s.lastEmpty = now
+	}
+	if s.needVolume {
+		s.needVolume = false
+		if _, err := fmt.Fprintf(w, "\x1b_SyncTERM:A;Volume;C=%d;V=%ddB\x1b\\", s.cfg.Channel, s.cfg.VolumeDB); err != nil {
+			return err
+		}
 	}
 	if s.muted {
 		return nil // no polls, no resyncs, no primes while muted

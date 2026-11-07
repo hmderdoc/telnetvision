@@ -161,15 +161,20 @@ Set in `door.ini` (re-read per caller, no restart) or pass as `-flags`:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `encoding` | cp437 | glyph charset: `cp437` (byte `0xDF`) or `utf8` (`▀`) |
-| `color` | auto | `auto` (ask the terminal: 24-bit for SyncTERM/fTelnet/xterm-family, 16 for silent clients like NetRunner), `truecolor` (force 24-bit) or `16` (force the CGA palette) |
+| `color` | auto | starting depth: `auto` (ask the terminal: 24-bit for SyncTERM/fTelnet/xterm-family, 16 for silent clients like NetRunner), `truecolor` (force 24-bit), `256` (xterm palette, about a third of truecolor's bytes) or `16` (force the CGA palette). Callers can switch with **C** |
 | `shade` | true | 16-color path: per-cell shade glyphs (░▒▓) and half blocks chosen perceptually (shadeans); `false` = plain dithered half blocks |
 | `saturation` / `dither` | 1.8 / true | 16-color path only (`dither` only with `shade = false`) |
-| `fps` | 15 | max frames/sec (the pacer drops below this on slow links) |
-| `hint` | true | show a brief "Q/ESC to quit" banner on launch |
+| `fps` | 15 | starting max frames/sec (the pacer drops below this on slow links). Callers can cycle 2/5/10/15/24/30 with **F** |
+| `delta` | 10 | noise gate: a cell is left alone while its colours move by at most this much per channel (all colour paths) |
+| `hint` | true | open the key-help dialog at launch (closes on any key, or by itself after 10 s) |
 | `channel` | cam | which channel to subscribe to |
 | `debug` | — | path to log capture-device list + effective fps |
 
-`color = auto` gives a SyncTERM caller 24-bit and a NetRunner caller 16 colors automatically; set `truecolor` or `16` only to force one for everybody.
+`color = auto` gives a SyncTERM caller 24-bit and a NetRunner caller 16 colors automatically; set `truecolor`, `256` or `16` only to force one for everybody.
+
+**Caller keys.** `C` color mode (16 → 256 → true) · `+` / `-` volume · `M` mute · `F` frame rate · `?` help · `Q` (or `X`, Ctrl-C) quit. Any other key, ENTER included, opens the help dialog; with the dialog open, any key closes it and ESC closes it too (ESC quits otherwise). Changes show briefly on the top row.
+
+**Off air.** When no frame has arrived from the relay for 5 seconds (the producer stopped, or never started) the door shows a color-bar test card with an *OFF AIR* panel, and goes back to the picture as soon as frames return. The relay forgets a departed producer's last frame, so a caller joining later gets the test card, not a frozen picture.
 
 ### Audio streaming
 
@@ -182,7 +187,7 @@ Producer `.env` keys:
 | `AUDIO` | `0` | `1` captures and streams audio alongside video. |
 | `AUDIO_SOURCE` | *auto* | Where the sound comes from: *auto* demuxes a URL/file `SOURCE`'s own track (via ffmpeg) and falls back to the default mic for webcams; `mic` forces the default input device; `":<name substring>"`/`":<index>"` picks a specific input device. Devices are captured with PortAudio (`pip install sounddevice`) because ffmpeg's audio-only device capture runs at ~0.4× realtime on macOS — constant chop. Anything else is an ffmpeg input (URL/file). |
 | `AUDIO_RATE` / `AUDIO_CHANNELS` | `44100` / `2` | Capture format. The terminal mixes at 44.1 kHz stereo, but it resamples whatever you send — `22050` / `1` sounds fine for TV/speech and cuts the wire cost 4× (~59 KB/s as WAV instead of ~235). Start there; go up only if the link has headroom. |
-| `AUDIO_CODEC` | `auto` | Chunk container: `flac` roughly halves bandwidth but needs `pip install soundfile`; `wav` works everywhere; `auto` picks flac when available. |
+| `AUDIO_CODEC` | `auto` | Chunk container on the producer→relay leg: `flac` roughly halves that leg but needs `pip install soundfile`; `wav` works everywhere; `auto` picks flac when available. The door re-encodes PCM WAV for each caller (see `audio_codec` below); FLAC chunks are passed through as-is. |
 | `AUDIO_CHUNK_MS` | `80` | Chunk size, 40–200. Smaller = lower latency, more per-chunk overhead. |
 | `AUDIO_OFFSET_MS` | `0` | Lip-sync trim. Positive shifts audio earlier relative to video — use it if you hear words after seeing the lips move. |
 
@@ -199,7 +204,8 @@ Door `door.ini` keys (all optional):
 | `audio_prebuffer` | `3` | jitter cushion: this many chunks of reserve (as a silent clip) at stream start and after every underrun. Bigger = smoother on jittery links, at ~chunk×N extra latency |
 | `audio_resync_secs` | `60` | blind tail cap: after this long of continuous playback with no proof the channel was ever empty, flush once — sheds terminal-side clock-drift latency the ledger can't see (lameboy's periodic resync). `0` disables |
 | `sync_slack_ms` | `120` | A/V tolerance before a video frame is dropped (behind audio) or held (ahead) |
-| `audio_volume_db` | `-6` | channel base level, set once at session start |
+| `audio_volume_db` | `-6` | channel base level at session start; callers move it in 3 dB steps with `+`/`-` (-45 to +6 dB) |
+| `audio_codec` | `adpcm` | what the door sends each caller: `adpcm` = IMA ADPCM WAV (a quarter of 16-bit PCM; some hiss on quiet material), `ulaw` = G.711 u-law WAV (half; cleaner), `pcm` = 16-bit WAV as before. The door asks the caller's SyncTERM which formats its libsndfile decodes (`Q;libsndfileFormat`) and falls back adpcm → ulaw → pcm; SyncTERM builds that predate that query get pcm. The 3dBBS handheld always gets 8-bit PCM |
 
 ### The service (cloud side)
 
